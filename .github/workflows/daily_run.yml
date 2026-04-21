@@ -2,8 +2,8 @@ name: Daily Stock Analysis
 
 on:
   schedule:
-    - cron: '0 17 * * *'  # 한국시간 새벽 2시 (UTC 17:00)
-  workflow_dispatch:        # 수동 실행 버튼
+    - cron: '0 17 * * *'
+  workflow_dispatch:
 
 jobs:
   analyze:
@@ -18,7 +18,7 @@ jobs:
 
       - name: 라이브러리 설치
         run: |
-          pip install pandas requests FinanceDataReader \
+          pip install pandas requests finance-datareader \
                       gspread google-auth beautifulsoup4 \
                       lxml openpyxl
 
