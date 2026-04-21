@@ -1,543 +1,524 @@
-import requests
-import pandas as pd
-import time
-import FinanceDataReader as fdr
+import requests, pandas as pd, time, zipfile, io, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
-import zipfile
-import io
-import xml.etree.ElementTree as ET
 
-DART_API_KEY = "7d2191837b9373fc6f049fd6fa30d7678f2f96f6"
+try:
+    import FinanceDataReader as fdr
+except ImportError:
+    fdr = None
+
+import gspread
+from google.oauth2.service_account import Credentials
+import json, os
+
+# ───────────────────────────────────────────────
+# 설정값
+# ───────────────────────────────────────────────
+DART_API_KEY = os.environ.get("DART_API_KEY", "7d2191837b9373fc6f049fd6fa30d7678f2f96f6")
+SHEETS_ID    = "1OqRboKwx7X0-3W67_raZyV2ZjcQ_G7ylHilf7SgAU88"
 TODAY        = datetime.today()
-TODAY_STR    = TODAY.strftime('%Y-%m-%d')
-THREE_YRS    = (TODAY - timedelta(days=365*3)).strftime('%Y-%m-%d')
-ONE_YR       = (TODAY - timedelta(days=365)).strftime('%Y-%m-%d')
-TWO_YRS      = (TODAY - timedelta(days=365*2)).strftime('%Y-%m-%d')
+TODAY_STR    = TODAY.strftime('%Y%m%d')
+THREE_YRS    = (TODAY - timedelta(days=365*3)).strftime('%Y%m%d')
+TWO_YRS      = (TODAY - timedelta(days=365*2)).strftime('%Y%m%d')
+ONE_YR       = (TODAY - timedelta(days=365)).strftime('%Y%m%d')
+MIN_MARCAP   = 150e8
+MAX_MARCAP   = 700e8
 
 THEME_DICT = {
-    "🏛️정치/선거":    ["정치","선거","국회","대선","총선","지방선거","여당","야당","정권"],
-    "🛡️방산/안보":    ["방산","국방","무기","미사일","드론","안보","군사","K-방산"],
-    "🤖AI/로봇":      ["AI","인공지능","로봇","자동화","챗GPT","딥러닝","머신러닝","LLM"],
-    "⚡에너지/전력":  ["전력","에너지","태양광","풍력","ESS","배터리","전기차","수소"],
-    "💊바이오/헬스":  ["바이오","헬스","신약","임상","의약","의료기기","제약","mRNA"],
-    "🌾농업/식품":    ["농업","식품","곡물","사료","비료","식량","유기농"],
-    "🚗자동차부품":   ["자동차","부품","EV","전기차부품","모터","변속기","자율주행"],
-    "🎬미디어/콘텐츠":["드라마","웹툰","콘텐츠","엔터","방송","OTT","K-콘텐츠","영화"],
-    "🏗️건설/부동산":  ["건설","부동산","재개발","분양","아파트","GTX","리츠"],
-    "❄️계절/기후":    ["폭염","한파","홍수","기후","냉방","난방","방재","재해"],
-    "💰화폐/금융":    ["코인","가상화폐","비트코인","금융","핀테크","증권","토큰"],
-    "🏭제조/소재":    ["소재","화학","철강","알루미늄","희토류","반도체소재","부품"],
-    "📡IT/통신":      ["통신","5G","6G","네트워크","위성","IoT","클라우드","데이터센터"],
-    "👶저출산/복지":  ["저출산","복지","육아","보육","노인","실버","교육"],
-    "🕊️대북/통일":   ["대북","통일","남북","북한","경협","개성"],
+    "🏛️정치/선거": ["선거","정치","대선","총선","정권","여당","야당","국회","후보"],
+    "🛡️방산/안보": ["방산","방위","무기","군","안보","국방","미사일","전투기","드론"],
+    "🤖AI/로봇": ["인공지능","AI","로봇","자동화","머신러닝","딥러닝","챗봇","LLM"],
+    "⚡에너지/전력": ["에너지","전력","태양광","풍력","배터리","ESS","전기차","수소","원전"],
+    "💊바이오/헬스": ["바이오","신약","임상","의료","헬스케어","제약","치료제","백신"],
+    "🌾농업/식품": ["농업","식품","먹거리","농산물","수출","식량","가공식품"],
+    "🚗자동차부품": ["자동차","부품","완성차","전장","모빌리티","차량"],
+    "🎬미디어/콘텐츠": ["미디어","콘텐츠","엔터","드라마","영화","방송","OTT","게임"],
+    "🏗️건설/부동산": ["건설","부동산","아파트","재건축","개발","토목","시공"],
+    "❄️계절/기후": ["계절","폭염","한파","기후","날씨","냉방","난방","이상기후"],
+    "💰화폐/금융": ["금융","은행","증권","보험","핀테크","가상화폐","코인","블록체인"],
+    "🏭제조/소재": ["제조","소재","철강","화학","반도체","소부장","부품","원자재"],
+    "📡IT/통신": ["IT","통신","5G","6G","네트워크","클라우드","반도체","데이터센터"],
+    "👶저출산/복지": ["저출산","복지","육아","보육","출산","인구","고령화","노인"],
+    "🕊️대북/통일": ["대북","통일","남북","북한","개성","비핵화","평화"]
 }
 
-BAD_DISCLOSURE_KW = [
-    "전환사채","신주인수권부사채","유상증자",
-    "전환가액 조정","제3자배정","사모사채"
-]
+BAD_KW  = ["전환사채","신주인수권부사채","유상증자","전환가액 조정","제3자배정","사모사채","CB","BW"]
+GOOD_KW = ["계약","수주","MOU","협약","공급","납품","신사업","진출","개발","출시","허가","승인"]
 
-GOOD_NEWS_KW = [
-    "계약","수주","MOU","협약","공급","납품",
-    "신사업","진출","개발","출시","허가","승인"
-]
-
-# ══════════════════════════════════════════════════════
+# ───────────────────────────────────────────────
 # DART 유틸
-# ══════════════════════════════════════════════════════
+# ───────────────────────────────────────────────
 def load_corp_code_map():
+    url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={DART_API_KEY}"
     try:
-        url  = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={DART_API_KEY}"
-        r    = requests.get(url, timeout=30)
-        z    = zipfile.ZipFile(io.BytesIO(r.content))
-        xml  = z.read('CORPCODE.xml')
-        root = ET.fromstring(xml)
-        return {
-            item.findtext('stock_code','').strip(): item.findtext('corp_code','').strip()
-            for item in root.findall('list')
-            if len(item.findtext('stock_code','').strip()) == 6
-        }
-    except:
+        r = requests.get(url, timeout=30)
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        xml_data = z.read("CORPCODE.xml")
+        root = ET.fromstring(xml_data)
+        mp = {}
+        for item in root.findall("list"):
+            code  = item.findtext("corp_code","").strip()
+            stock = item.findtext("stock_code","").strip()
+            name  = item.findtext("corp_name","").strip()
+            if stock:
+                mp[stock] = {"corp_code": code, "corp_name": name}
+        return mp
+    except Exception as e:
+        print(f"[DART corp_code 로드 실패] {e}")
         return {}
 
-def dart_get(endpoint, params):
+def dart_disclosures(corp_code, bgn_de, end_de, pblntf_ty="A"):
+    url = "https://opendart.fss.or.kr/api/list.json"
+    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code,
+              "bgn_de": bgn_de, "end_de": end_de,
+              "pblntf_ty": pblntf_ty, "page_count": 100}
     try:
-        params['crtfc_key'] = DART_API_KEY
-        r = requests.get(
-            f"https://opendart.fss.or.kr/api/{endpoint}",
-            params=params, timeout=15
-        )
-        return r.json()
-    except:
-        return {}
-
-def get_dart_financials(corp_code, year):
-    data = dart_get("fnlttSinglAcntAll.json", {
-        "corp_code":  corp_code,
-        "bsns_year":  str(year),
-        "reprt_code": "11011",
-        "fs_div":     "OFS"
-    })
-    return data.get("list", [])
-
-def extract_amount(fin_list, account_name):
-    for item in fin_list:
-        if item.get("account_nm","") == account_name:
-            val = item.get("thstrm_amount","").replace(",","").replace(" ","")
-            try:
-                return round(int(val) / 1e8, 2)
-            except:
-                return None
-    return None
-
-# ══════════════════════════════════════════════════════
-# LAYER 0 — 유니버스 (KRX 직접 호출 제거, FDR만 사용)
-# ══════════════════════════════════════════════════════
-def layer0_universe():
-    results, logs = [], []
-    for market in ['KOSDAQ', 'KOSPI']:
-        try:
-            df = fdr.StockListing(market)
-        except Exception as e:
-            logs.append(('', market, f"L0: 종목 로드 실패 {e}"))
-            continue
-        for _, row in df.iterrows():
-            code   = str(row.get('Code', '')).zfill(6)
-            name   = str(row.get('Name', ''))
-            marcap = float(row.get('Marcap', 0) or 0)
-            if not code or not name:
-                continue
-            if marcap < 150_0000_0000:
-                logs.append((code, name, "L0: 시총 150억 미달"))
-                continue
-            if market == 'KOSDAQ':
-                limit = 500_0000_0000 if marcap < 600_0000_0000 else 700_0000_0000
-            else:
-                limit = 700_0000_0000
-            if marcap > limit:
-                logs.append((code, name, f"L0: 시총 {round(marcap/1e8)}억 상한 초과"))
-                continue
-            excl_kw = ['우','스팩','SPAC','우선','홀딩스우','차이나','중국','CR']
-            if any(kw in name for kw in excl_kw):
-                logs.append((code, name, "L0: 우선주/스팩/중국 제외"))
-                continue
-            results.append({
-                '종목코드': code, '종목명': name,
-                '시장': market, '시가총액(억)': round(marcap / 1e8)
-            })
-    return pd.DataFrame(results), logs
-
-# ══════════════════════════════════════════════════════
-# LAYER 1 — 하드 탈락 필터
-# ══════════════════════════════════════════════════════
-def layer1_hard_filter(df, corp_map):
-    results, logs = [], []
-    for _, row in df.iterrows():
-        code   = row['종목코드']
-        name   = row['종목명']
-        marcap = row['시가총액(억)'] * 1e8
-        market = row['시장']
-        corp   = corp_map.get(code)
-        fail   = False
-
-        # 1-A. 52주 저가 대비 주가 위치
-        try:
-            dp    = fdr.DataReader(code, ONE_YR, TODAY_STR)
-            if dp is None or len(dp) < 20:
-                logs.append((code, name, "L1: 주가 데이터 부족"))
-                continue
-            low_52  = dp['Low'].min()
-            cur_prc = dp['Close'].iloc[-1]
-            ratio   = 1.5 if market == 'KOSPI' else 1.7
-            if cur_prc > low_52 * ratio:
-                logs.append((code, name, f"L1: 현재가>{ratio}배 탈락"))
-                continue
-        except Exception as e:
-            logs.append((code, name, f"L1: 주가 오류 {e}"))
-            continue
-
-        # 1-B. DART 재무 (3년)
-        op_list, debt_list, equity_list = [], [], []
-        paid_in_cap = None
-        if corp:
-            for yr in [TODAY.year-3, TODAY.year-2, TODAY.year-1]:
-                fin  = get_dart_financials(corp, yr)
-                time.sleep(0.15)
-                op   = extract_amount(fin, "영업이익")
-                de   = extract_amount(fin, "부채총계")
-                eq   = extract_amount(fin, "자본총계")
-                pc   = extract_amount(fin, "납입자본금")
-                op_list.append(op)
-                debt_list.append(de)
-                equity_list.append(eq)
-                if pc:
-                    paid_in_cap = pc
-
-            valid_op = [op for op in op_list if op is not None]
-            if len(valid_op) >= 3 and all(op <= 0 for op in valid_op):
-                logs.append((code, name, "L1: 3년 연속 영업손실"))
-                fail = True
-
-            if not fail and debt_list[-1] and equity_list[-1] and equity_list[-1] > 0:
-                dr = debt_list[-1] / equity_list[-1] * 100
-                if dr >= 100:
-                    logs.append((code, name, f"L1: 부채비율 {round(dr)}%"))
-                    fail = True
-
-            if not fail and paid_in_cap and equity_list[-1] is not None and paid_in_cap > 0:
-                erosion = (paid_in_cap - equity_list[-1]) / paid_in_cap * 100
-                if erosion >= 50:
-                    logs.append((code, name, f"L1: 자본잠식 {round(erosion)}%"))
-                    fail = True
-
-        if fail:
-            continue
-
-        # 1-C. CB/BW/유증 공시
-        if corp:
-            disc = dart_get("list.json", {
-                "corp_code":  corp,
-                "bgn_de":     (TODAY - timedelta(days=730)).strftime('%Y%m%d'),
-                "end_de":     TODAY.strftime('%Y%m%d'),
-                "page_count": 100
-            })
-            time.sleep(0.15)
-            for item in disc.get("list", []):
-                title = item.get("report_nm", "")
-                if any(kw in title for kw in BAD_DISCLOSURE_KW):
-                    logs.append((code, name, f"L1: 불량공시 [{title[:30]}]"))
-                    fail = True
-                    break
-        if fail:
-            continue
-
-        # 1-D. 호재 뉴스 남발
-        good_count = count_good_news(name)
-        time.sleep(0.2)
-        if good_count >= 4:
-            logs.append((code, name, f"L1: 호재뉴스 {good_count}건"))
-            continue
-
-        row_out = row.to_dict()
-        row_out.update({
-            '_dp': dp, '_corp': corp,
-            '현재가': cur_prc, '52주최저가': low_52,
-            '영업이익_3년': op_list,
-            '부채_3년': debt_list,
-            '자본_3년': equity_list,
-            '납입자본금': paid_in_cap,
-        })
-        results.append(row_out)
-
-    return pd.DataFrame(results), logs
-
-# ══════════════════════════════════════════════════════
-# LAYER 2 — 재무 점수
-# ══════════════════════════════════════════════════════
-def layer2_finance_score(df):
-    for idx, row in df.iterrows():
-        score, detail = 0, []
-        op_list   = row.get('영업이익_3년', [])
-        debt_list = row.get('부채_3년', [])
-        eq_list   = row.get('자본_3년', [])
-        marcap    = row['시가총액(억)'] * 1e8
-        corp      = row.get('_corp')
-
-        valid_op = [op for op in op_list if op is not None]
-        if len(valid_op) >= 3 and all(op > 0 for op in valid_op):
-            score += 3; detail.append("3년흑자+3")
-        elif len(valid_op) >= 2 and all(op > 0 for op in valid_op[-2:]):
-            score += 1; detail.append("2년흑자+1")
-
-        rev = None
-        if corp:
-            fin_l = get_dart_financials(corp, TODAY.year-1)
-            time.sleep(0.15)
-            rev = extract_amount(fin_l, "매출액")
-            if rev is None:
-                rev = extract_amount(fin_l, "수익(매출액)")
-        if rev and marcap > 0:
-            ratio = (rev * 1e8) / marcap
-            if ratio >= 1.0:   score += 2; detail.append("매출/시총≥1+2")
-            elif ratio >= 0.5: score += 1; detail.append("매출/시총≥0.5+1")
-
-        if len(debt_list) >= 2 and len(eq_list) >= 2:
-            dr_prev = (debt_list[-2]/eq_list[-2]*100) if eq_list[-2] else None
-            dr_cur  = (debt_list[-1]/eq_list[-1]*100) if eq_list[-1] else None
-            if dr_prev and dr_cur:
-                if dr_cur < dr_prev: score += 1; detail.append("부채감소+1")
-                if dr_cur < 50:      score += 2; detail.append("부채<50%+2")
-                elif dr_cur < 100:   score += 1; detail.append("부채<100%+1")
-
-        if corp:
-            fin_l2 = get_dart_financials(corp, TODAY.year-1)
-            time.sleep(0.15)
-            retained = extract_amount(fin_l2, "이익잉여금")
-            paid_cap = row.get('납입자본금')
-            if retained and paid_cap and paid_cap > 0:
-                rr = retained / paid_cap * 100
-                if rr >= 500:   score += 2; detail.append("적립금≥500%+2")
-                elif rr >= 300: score += 1; detail.append("적립금≥300%+1")
-
-        if eq_list and eq_list[-1] and eq_list[-1] > 0 and corp:
-            fin_l3 = get_dart_financials(corp, TODAY.year-1)
-            time.sleep(0.15)
-            ni = extract_amount(fin_l3, "당기순이익")
-            if ni and ni / eq_list[-1] * 100 >= 10:
-                score += 1; detail.append("ROE≥10%+1")
-
-        if corp:
-            div = dart_get("alotMatter.json", {
-                "corp_code": corp,
-                "bgn_de": TWO_YRS.replace('-',''),
-                "end_de": TODAY_STR.replace('-',''),
-            })
-            time.sleep(0.15)
-            if div.get("list"):
-                score += 1; detail.append("배당이력+1")
-
-        if eq_list and eq_list[-1] and (eq_list[-1] * 1e8) > marcap:
-            score += 2; detail.append("순자산>시총+2")
-
-        df.at[idx, '재무점수'] = score
-        df.at[idx, '재무상세'] = ' / '.join(detail)
-        df.at[idx, '매출액(억)'] = rev
-
-    return df
-
-# ══════════════════════════════════════════════════════
-# LAYER 3 — 유동성
-# ══════════════════════════════════════════════════════
-def layer3_liquidity(df):
-    results, logs = [], []
-    for _, row in df.iterrows():
-        code, name = row['종목코드'], row['종목명']
-        try:
-            dp3 = fdr.DataReader(code, THREE_YRS, TODAY_STR)
-            dp3['거래대금'] = dp3['Close'] * dp3['Volume']
-        except:
-            logs.append((code, name, "L3: 3년 데이터 실패"))
-            continue
-        peak_vol   = dp3['거래대금'].max()
-        recent_avg = dp3['거래대금'].tail(10).mean()
-        if peak_vol < 100_0000_0000:
-            logs.append((code, name, f"L3: 최대거래대금 {round(peak_vol/1e8,1)}억"))
-            continue
-        row_out = row.to_dict()
-        row_out.update({
-            '_dp3': dp3,
-            '3년최대거래대금(억)':      round(peak_vol/1e8, 1),
-            '최근10일평균거래대금(억)': round(recent_avg/1e8, 1),
-        })
-        results.append(row_out)
-    return pd.DataFrame(results), logs
-
-# ══════════════════════════════════════════════════════
-# LAYER 4 — 주주 구조
-# ══════════════════════════════════════════════════════
-def layer4_shareholder(df):
-    for idx, row in df.iterrows():
-        corp = row.get('_corp')
-        if not corp:
-            df.at[idx, '최대주주지분(%)'] = None
-            df.at[idx, '주주구조등급']    = '확인불가'
-            continue
-        try:
-            data  = dart_get("majorstock.json", {
-                "corp_code":  corp,
-                "bsns_year":  str(TODAY.year-1),
-                "reprt_code": "11011"
-            })
-            time.sleep(0.15)
-            items = data.get("list", [])
-            if not items:
-                df.at[idx, '최대주주지분(%)'] = None
-                df.at[idx, '주주구조등급']    = '데이터없음'
-                continue
-            top   = float(str(items[0].get('trmend_posesn_stock_co','0')).replace(',','') or 0)
-            total = float(str(items[0].get('trmend_tot_stock_co','1')).replace(',','') or 1)
-            ratio = round(top / total * 100, 1) if total > 0 else 0
-            df.at[idx, '최대주주지분(%)'] = ratio
-            if ratio < 30 or ratio >= 70:
-                df.at[idx, '주주구조등급'] = '✅선호'
-            elif ratio < 50:
-                df.at[idx, '주주구조등급'] = '⚠️경고'
-            else:
-                df.at[idx, '주주구조등급'] = '🔴주의'
-        except:
-            df.at[idx, '최대주주지분(%)'] = None
-            df.at[idx, '주주구조등급']    = '조회오류'
-    return df
-
-# ══════════════════════════════════════════════════════
-# LAYER 5 — 테마
-# ══════════════════════════════════════════════════════
-def get_naver_news(name):
-    hdrs = {"User-Agent": "Mozilla/5.0"}
-    url  = f"https://search.naver.com/search.naver?where=news&query={requests.utils.quote(name)}&sort=1"
-    try:
-        soup   = BeautifulSoup(requests.get(url, headers=hdrs, timeout=10).text, 'html.parser')
-        items  = soup.select('.news_tit')[:10]
-        titles = [i.get_text() for i in items]
-        return " ".join(titles), titles[:3]
-    except:
-        return "", []
-
-def count_good_news(name):
-    text, _ = get_naver_news(name)
-    return sum(1 for kw in GOOD_NEWS_KW if kw in text)
-
-def layer5_theme(df):
-    for idx, row in df.iterrows():
-        name = row['종목명']
-        code = row['종목코드']
-        text, headlines = get_naver_news(name)
-        time.sleep(0.3)
-        matched = [t for t, kws in THEME_DICT.items() if any(k in text for k in kws)]
-        score   = 0
-        political = [t for t in matched if "정치" in t or "선거" in t]
-        policy    = [t for t in matched if any(x in t for x in ["방산","에너지","AI","로봇"])]
-        seasonal  = [t for t in matched if "계절" in t or "기후" in t]
-        social    = [t for t in matched if any(x in t for x in ["저출산","복지","대북"])]
-        score += min(len(political)*2, 4)
-        score += min(len(policy)*2, 4)
-        score += min(len(seasonal), 2)
-        score += min(len(social), 2)
-        try:
-            dp5   = fdr.DataReader(code, (TODAY-timedelta(days=365*5)).strftime('%Y-%m-%d'), TODAY_STR)
-            max_r = (dp5['Close'].max() - dp5['Close'].iloc[0]) / dp5['Close'].iloc[0] * 100
-            if max_r >= 200:
-                score += 2; matched.append("📈5년급등이력")
-        except:
-            pass
-        df.at[idx, '테마분류'] = ' / '.join(matched) if matched else '해당없음'
-        df.at[idx, '테마점수'] = min(score, 10)
-        df.at[idx, '최신뉴스'] = ' | '.join(headlines)
-    return df
-
-# ══════════════════════════════════════════════════════
-# LAYER 6 — 매수 타이밍 + 세력 매집
-# ══════════════════════════════════════════════════════
-def get_market_change():
-    try:
-        kq = fdr.DataReader('KQ11', (TODAY-timedelta(days=10)).strftime('%Y-%m-%d'), TODAY_STR)
-        if len(kq) >= 2:
-            return round((kq['Close'].iloc[-1]-kq['Close'].iloc[-2])/kq['Close'].iloc[-2]*100, 2)
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if data.get("status") == "000":
+            return data.get("list", [])
     except:
         pass
-    return 0.0
+    return []
 
-def layer6_timing_accumulation(df):
-    market_chg = get_market_change()
-    for idx, row in df.iterrows():
-        dp      = row.get('_dp3') or row.get('_dp')
-        cur_prc = row.get('현재가', 0)
-        low_52  = row.get('52주최저가', 0)
-        score, signals = 0, []
-        if dp is not None and len(dp) >= 20:
-            dp['거래대금'] = dp['Close'] * dp['Volume']
-            vol_60 = dp['Volume'].tail(60).mean()
-            vol_5  = dp['Volume'].tail(5).mean()
-            if vol_60 > 0:
-                vr = vol_5 / vol_60
-                if vr >= 5.0:   score += 3; signals.append(f"🔥거래량{round(vr,1)}배급증")
-                elif vr >= 3.0: score += 2; signals.append(f"⚡거래량{round(vr,1)}배증가")
-                elif vr >= 1.5: score += 1; signals.append(f"거래량{round(vr,1)}배")
-            r5 = dp.tail(5)
-            if r5['Low'].min() > 0:
-                rng = (r5['High'].max()-r5['Low'].min())/r5['Low'].min()*100
-                if rng < 3.0:   score += 2; signals.append(f"횡보({round(rng,1)}%)")
-                elif rng < 5.0: score += 1; signals.append(f"좁은범위({round(rng,1)}%)")
-            r3 = dp.tail(3)
-            if all(r3['Close'].values[i] >= r3['Open'].values[i] for i in range(len(r3))):
-                score += 2; signals.append("3일연속양봉")
-            if cur_prc and low_52 and low_52 > 0:
-                prx = cur_prc / low_52
-                if prx <= 1.3:   score += 2; signals.append(f"저가×{round(prx,2)}(근접)")
-                elif prx <= 1.5: score += 1; signals.append(f"저가×{round(prx,2)}")
-            recent10 = dp['거래대금'].tail(10).mean()
-            if recent10 <= 80_0000_0000:
-                score += 1; signals.append("거래대금80억↓")
-            if len(dp) >= 2:
-                last_chg = (dp['Close'].iloc[-1]-dp['Close'].iloc[-2])/dp['Close'].iloc[-2]*100
-                if last_chg <= -5:
-                    score -= 2; signals.append("⚠️대형음봉")
-        if market_chg <= -1.5:
-            score += 1; signals.append(f"시장하락{market_chg}%")
-        df.at[idx, '매집점수']   = max(score, 0)
-        df.at[idx, '매집신호']   = ' | '.join(signals) if signals else '신호없음'
-        df.at[idx, '시장등락률'] = market_chg
+def dart_financials(corp_code, year):
+    url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code,
+              "bsns_year": str(year), "reprt_code": "11011", "fs_div": "CFS"}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if data.get("status") == "000":
+            return data.get("list", [])
+    except:
+        pass
+    return []
+
+def get_account(items, names):
+    for item in items:
+        for n in names:
+            if n in item.get("account_nm",""):
+                try:
+                    return float(item.get("thstrm_amount","0").replace(",",""))
+                except:
+                    pass
+    return None
+
+# ───────────────────────────────────────────────
+# LAYER 0 — 유니버스
+# ───────────────────────────────────────────────
+def layer0_universe():
+    stocks = []
+    for mkt in ["KOSDAQ","KOSPI"]:
+        try:
+            df = fdr.StockListing(mkt)
+            df.columns = [c.strip() for c in df.columns]
+            # 시총 컬럼명 유연 처리
+            cap_col = next((c for c in df.columns if "시가총액" in c or "Marcap" in c or "marcap" in c), None)
+            name_col = next((c for c in df.columns if "종목명" in c or "Name" in c or "name" in c), None)
+            code_col = next((c for c in df.columns if "종목코드" in c or "Code" in c or "code" in c or "Symbol" in c), None)
+            if not all([cap_col, name_col, code_col]):
+                continue
+            df = df[[code_col, name_col, cap_col]].copy()
+            df.columns = ["code","name","marcap"]
+            df["market"] = mkt
+            df["marcap"] = pd.to_numeric(df["marcap"], errors="coerce").fillna(0)
+            df = df[df["marcap"] >= MIN_MARCAP]
+            df = df[df["marcap"] <= MAX_MARCAP]
+            # 제외 키워드
+            exclude = ["스팩","SPAC","우","중국","홀딩스","리츠","기업인수"]
+            for kw in exclude:
+                df = df[~df["name"].str.contains(kw, na=False)]
+            stocks.append(df)
+        except Exception as e:
+            print(f"[L0 {mkt} 오류] {e}")
+    if not stocks:
+        return pd.DataFrame()
+    return pd.concat(stocks, ignore_index=True)
+
+# ───────────────────────────────────────────────
+# LAYER 1 — 하드 필터
+# ───────────────────────────────────────────────
+def layer1_hard(row, corp_map):
+    code = str(row["code"]).zfill(6)
+    info = corp_map.get(code)
+    if not info:
+        return False, "DART corp_code 없음"
+
+    corp_code = info["corp_code"]
+
+    # CB/BW/유증 공시 (2년)
+    discs = dart_disclosures(corp_code, TWO_YRS, TODAY_STR)
+    for d in discs:
+        title = d.get("report_nm","")
+        for kw in BAD_KW:
+            if kw in title:
+                return False, f"공시탈락:{kw}"
+
+    # 재무 3개년 체크
+    years = [TODAY.year - 1, TODAY.year - 2, TODAY.year - 3]
+    op_profits = []
+    equity_list = []
+    debt_list = []
+    for yr in years:
+        items = dart_financials(corp_code, yr)
+        op  = get_account(items, ["영업이익"])
+        eq  = get_account(items, ["자본총계","자본합계"])
+        tot = get_account(items, ["부채총계","부채합계"])
+        op_profits.append(op)
+        equity_list.append(eq)
+        debt_list.append(tot)
+
+    # 3년 연속 영업손실
+    if all(v is not None and v < 0 for v in op_profits):
+        return False, "3년연속영업손실"
+
+    # 자본잠식 50% 이상
+    eq = equity_list[0]
+    if eq is not None and eq < 0:
+        return False, "완전자본잠식"
+
+    # 부채비율 100% 이상
+    if equity_list[0] and debt_list[0]:
+        if equity_list[0] > 0 and (debt_list[0] / equity_list[0]) >= 1.0:
+            return False, f"부채비율{int(debt_list[0]/equity_list[0]*100)}%"
+
+    # 호재뉴스 4건 이상 (DART 공시 기준)
+    good_count = sum(1 for d in discs if any(kw in d.get("report_nm","") for kw in GOOD_KW))
+    if good_count >= 4:
+        return False, f"호재공시{good_count}건초과"
+
+    return True, "통과"
+
+# ───────────────────────────────────────────────
+# LAYER 2 — 재무 점수
+# ───────────────────────────────────────────────
+def layer2_financial(corp_code, marcap):
+    score = 0
+    detail = []
+    years = [TODAY.year - 1, TODAY.year - 2, TODAY.year - 3]
+    financials = []
+    for yr in years:
+        items = dart_financials(corp_code, yr)
+        op    = get_account(items, ["영업이익"])
+        rev   = get_account(items, ["매출액","수익(매출액)"])
+        eq    = get_account(items, ["자본총계"])
+        net   = get_account(items, ["당기순이익"])
+        tot_a = get_account(items, ["자산총계"])
+        debt  = get_account(items, ["부채총계"])
+        res   = get_account(items, ["이익잉여금"])
+        div   = get_account(items, ["배당금","현금배당"])
+        financials.append({"op":op,"rev":rev,"eq":eq,"net":net,"tot_a":tot_a,"debt":debt,"res":res,"div":div})
+
+    f0, f1, f2 = financials[0], financials[1], financials[2]
+
+    # 3년 연속 흑자 +3, 2년 +1
+    ops = [f["op"] for f in financials]
+    if all(v is not None and v > 0 for v in ops):
+        score += 3; detail.append("3년연속흑자+3")
+    elif ops[0] and ops[1] and ops[0] > 0 and ops[1] > 0:
+        score += 1; detail.append("2년흑자+1")
+
+    # 매출/시총
+    if f0["rev"] and marcap > 0:
+        ratio = f0["rev"] / marcap
+        if ratio >= 1.0:
+            score += 2; detail.append("매출/시총≥1+2")
+        elif ratio >= 0.5:
+            score += 1; detail.append("매출/시총≥0.5+1")
+
+    # 부채비율
+    if f0["debt"] and f0["eq"] and f0["eq"] > 0:
+        dr = f0["debt"] / f0["eq"] * 100
+        if dr < 50:
+            score += 2; detail.append("부채<50%+2")
+        elif dr < 100:
+            score += 1; detail.append("부채50-99%+1")
+        # 부채비율 감소 추세
+        if f1["debt"] and f1["eq"] and f1["eq"] > 0:
+            dr1 = f1["debt"] / f1["eq"] * 100
+            if dr < dr1:
+                score += 1; detail.append("부채감소+1")
+
+    # 적립금비율
+    if f0["res"] and f0["eq"] and f0["eq"] > 0:
+        rr = f0["res"] / f0["eq"] * 100
+        if rr >= 500:
+            score += 2; detail.append("적립금≥500%+2")
+        elif rr >= 300:
+            score += 1; detail.append("적립금≥300%+1")
+
+    # ROE
+    if f0["net"] and f0["eq"] and f0["eq"] > 0:
+        roe = f0["net"] / f0["eq"] * 100
+        if roe >= 10:
+            score += 1; detail.append(f"ROE{roe:.1f}%+1")
+
+    # 배당
+    if f0["div"] and f0["div"] > 0:
+        score += 1; detail.append("배당지급+1")
+    elif f1["div"] and f1["div"] > 0:
+        score += 1; detail.append("전년배당+1")
+
+    # 순자산 > 시총
+    if f0["eq"] and marcap > 0 and f0["eq"] > marcap:
+        score += 2; detail.append("순자산>시총+2")
+
+    return score, detail
+
+# ───────────────────────────────────────────────
+# LAYER 3 — 매집/유동성
+# ───────────────────────────────────────────────
+def layer3_liquidity(code):
+    result = {"pass": False, "accum_score": 0, "detail": []}
+    try:
+        df = fdr.DataReader(code, (TODAY - timedelta(days=365*3)).strftime('%Y-%m-%d'), TODAY.strftime('%Y-%m-%d'))
+        if df is None or len(df) < 20:
+            return result
+
+        df["turnover"] = df["Close"] * df["Volume"]
+        max_turn = df["turnover"].max()
+
+        # 3년내 1일 거래대금 1000억 이상
+        if max_turn >= 100e9:
+            result["pass"] = True
+            result["detail"].append("3년내거래대금1000억달성")
+        else:
+            return result
+
+        recent = df.tail(10)
+        avg60  = df["turnover"].tail(60).mean()
+        avg10  = recent["turnover"].mean()
+
+        # 10일 평균 거래대금 800억 이하
+        if avg10 <= 80e9:
+            result["accum_score"] += 2
+            result["detail"].append("10일평균≤800억+2")
+
+        # 거래량 스파이크
+        vol_avg = df["Volume"].tail(60).mean()
+        recent_vol = df["Volume"].tail(5).max()
+        if vol_avg > 0 and recent_vol >= vol_avg * 5:
+            result["accum_score"] += 3
+            result["detail"].append("거래량5배스파이크+3")
+        elif vol_avg > 0 and recent_vol >= vol_avg * 3:
+            result["accum_score"] += 1
+            result["detail"].append("거래량3배스파이크+1")
+
+        # 연속 양봉
+        closes = df["Close"].tail(5).values
+        opens  = df["Open"].tail(5).values if "Open" in df.columns else closes
+        consec = sum(1 for i in range(len(closes)) if closes[i] > opens[i])
+        if consec >= 3:
+            result["accum_score"] += 1
+            result["detail"].append(f"연속양봉{consec}일+1")
+
+    except Exception as e:
+        print(f"[L3 {code} 오류] {e}")
+
+    return result
+
+# ───────────────────────────────────────────────
+# LAYER 4 — 주주구조
+# ───────────────────────────────────────────────
+def layer4_shareholder(corp_code):
+    url = "https://opendart.fss.or.kr/api/majorstock.json"
+    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if data.get("status") == "000":
+            items = data.get("list", [])
+            if items:
+                try:
+                    ratio = float(items[0].get("stock_ratio","0").replace(",","").replace("%",""))
+                    if ratio <= 30 or ratio >= 70:
+                        return True, f"최대주주{ratio:.1f}%우량"
+                    elif ratio <= 50:
+                        return True, f"최대주주{ratio:.1f}%경고"
+                    else:
+                        return True, f"최대주주{ratio:.1f}%"
+                except:
+                    pass
+    except:
+        pass
+    return True, "주주정보없음"
+
+# ───────────────────────────────────────────────
+# LAYER 5 — 테마 점수
+# ───────────────────────────────────────────────
+def layer5_theme(name, corp_code):
+    score = 0
+    themes = []
+    try:
+        # DART 최근 공시 제목으로 테마 분류
+        discs = dart_disclosures(corp_code, ONE_YR, TODAY_STR)
+        text = " ".join([d.get("report_nm","") for d in discs]) + " " + name
+        for theme, kws in THEME_DICT.items():
+            if any(kw in text for kw in kws):
+                score += 2
+                themes.append(theme)
+    except:
+        pass
+    return score, themes
+
+# ───────────────────────────────────────────────
+# LAYER 6 — 매수 타이밍
+# ───────────────────────────────────────────────
+def layer6_timing(code, market):
+    result = {"pass": False, "detail": []}
+    try:
+        df = fdr.DataReader(code, (TODAY - timedelta(days=365)).strftime('%Y-%m-%d'), TODAY.strftime('%Y-%m-%d'))
+        if df is None or len(df) < 20:
+            return result
+
+        current = df["Close"].iloc[-1]
+        low52   = df["Low"].min() if "Low" in df.columns else df["Close"].min()
+        ratio   = 1.5 if market == "KOSPI" else 1.7
+        threshold = low52 * ratio
+
+        if current <= threshold:
+            result["detail"].append(f"현재가≤52주저가×{ratio}✅")
+        else:
+            result["detail"].append(f"현재가>52주저가×{ratio}❌")
+            return result
+
+        # 전일 시장 하락 1.5% 이상 확인
+        idx_code = "KS11" if market == "KOSPI" else "KQ11"
+        try:
+            idx = fdr.DataReader(idx_code, (TODAY - timedelta(days=5)).strftime('%Y-%m-%d'), TODAY.strftime('%Y-%m-%d'))
+            if len(idx) >= 2:
+                prev_ret = (idx["Close"].iloc[-1] - idx["Close"].iloc[-2]) / idx["Close"].iloc[-2] * 100
+                if prev_ret <= -1.5:
+                    result["detail"].append(f"전일시장하락{prev_ret:.1f}%✅")
+                else:
+                    result["detail"].append(f"전일시장{prev_ret:.1f}%")
+        except:
+            pass
+
+        result["pass"] = True
+
+    except Exception as e:
+        print(f"[L6 {code} 오류] {e}")
+
+    return result
+
+# ───────────────────────────────────────────────
+# 등급 계산
+# ───────────────────────────────────────────────
+def grade(total_score, theme_score):
+    if total_score >= 16:
+        return "🌟핵심후보"
+    elif total_score >= 11:
+        return "⭐우선후보"
+    elif total_score >= 6:
+        return "관심후보"
+    else:
+        return "📊참고"
+
+# ───────────────────────────────────────────────
+# Google Sheets 저장
+# ───────────────────────────────────────────────
+def save_to_sheets(df):
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+    if not creds_json:
+        print("[Sheets] GOOGLE_CREDENTIALS 없음 - 저장 스킵")
+        return
+    try:
+        creds_dict = json.loads(creds_json)
+        scopes = ["https://spreadsheets.google.com/feeds",
+                  "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc    = gspread.authorize(creds)
+        sh    = gc.open_by_key(SHEETS_ID)
+        ws    = sh.sheet1
+        ws.clear()
+        ws.update([df.columns.tolist()] + df.values.tolist())
+        print(f"[Sheets] {len(df)}개 종목 저장 완료")
+    except Exception as e:
+        print(f"[Sheets 저장 오류] {e}")
+
+# ───────────────────────────────────────────────
+# 메인 파이프라인
+# ───────────────────────────────────────────────
+def run_pipeline():
+    print("=== Time-Travel TV 스크리너 시작 ===")
+    print(f"[L0] 유니버스 로딩...")
+    universe = layer0_universe()
+    if universe.empty:
+        print("[L0] 종목 없음 - 종료")
+        return pd.DataFrame()
+
+    print(f"[L0] {len(universe)}개 종목 확보")
+    corp_map = load_corp_code_map()
+    print(f"[DART] corp_code 맵 {len(corp_map)}개 로드")
+
+    results = []
+    for i, row in universe.iterrows():
+        code   = str(row["code"]).zfill(6)
+        name   = row["name"]
+        marcap = row["marcap"]
+        market = row["market"]
+        print(f"[{i+1}/{len(universe)}] {name}({code}) 분석 중...")
+
+        # L1
+        passed, reason = layer1_hard(row, corp_map)
+        if not passed:
+            print(f"  → L1탈락: {reason}")
+            continue
+
+        corp_code = corp_map[code]["corp_code"]
+
+        # L2
+        fin_score, fin_detail = layer2_financial(corp_code, marcap)
+        if fin_score < 7:
+            print(f"  → L2탈락: 재무점수{fin_score}")
+            continue
+
+        # L3
+        liq = layer3_liquidity(code)
+        if not liq["pass"]:
+            print(f"  → L3탈락: 거래대금미달")
+            continue
+
+        # L4
+        _, sh_detail = layer4_shareholder(corp_code)
+
+        # L5
+        theme_score, themes = layer5_theme(name, corp_code)
+
+        # L6
+        timing = layer6_timing(code, market)
+
+        total = fin_score + liq["accum_score"] + theme_score
+        g = grade(total, theme_score)
+
+        results.append({
+            "종목코드": code,
+            "종목명": name,
+            "시장": market,
+            "시총(억)": int(marcap/1e8),
+            "재무점수": fin_score,
+            "매집점수": liq["accum_score"],
+            "테마점수": theme_score,
+            "종합점수": total,
+            "등급": g,
+            "테마": ", ".join(themes),
+            "주주구조": sh_detail,
+            "L6타이밍": "✅" if timing["pass"] else "⏳",
+            "재무상세": " | ".join(fin_detail),
+            "매집상세": " | ".join(liq["detail"]),
+            "분석일": TODAY.strftime('%Y-%m-%d')
+        })
+        time.sleep(0.3)
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.sort_values("종합점수", ascending=False).reset_index(drop=True)
+        save_to_sheets(df)
+        print(f"=== 완료: 최종 {len(df)}개 후보 ===")
+    else:
+        print("=== 후보 없음 ===")
     return df
 
-# ══════════════════════════════════════════════════════
-# 종합 등급
-# ══════════════════════════════════════════════════════
-def calc_final_grade(df):
-    df['재무점수'] = pd.to_numeric(df.get('재무점수', 0), errors='coerce').fillna(0)
-    df['테마점수'] = pd.to_numeric(df.get('테마점수', 0), errors='coerce').fillna(0)
-    df['매집점수'] = pd.to_numeric(df.get('매집점수', 0), errors='coerce').fillna(0)
-    df['종합점수'] = df['재무점수'] + df['테마점수'] + df['매집점수']
-    def grade(s):
-        if s >= 16:  return "⭐핵심후보"
-        elif s >= 11: return "🔵우선후보"
-        elif s >= 6:  return "🟡관심"
-        else:         return "⚪참고"
-    df['등급'] = df['종합점수'].apply(grade)
-    return df.sort_values('종합점수', ascending=False)
-
-# ══════════════════════════════════════════════════════
-# 메인 파이프라인
-# ══════════════════════════════════════════════════════
-def run_pipeline(progress_callback=None):
-    all_logs = []
-    def log(msg):
-        if progress_callback:
-            progress_callback(msg)
-
-    log("📦 DART 기업코드 로드 중...")
-    corp_map = load_corp_code_map()
-    log(f"  → {len(corp_map)}개 로드 완료")
-
-    log("\n🔵 LAYER 0: 유니버스 구성 중...")
-    df0, l0 = layer0_universe()
-    all_logs += l0
-    log(f"  → 통과 {len(df0)}개 | 탈락 {len(l0)}개")
-
-    log("\n🔴 LAYER 1: 하드 탈락 필터...")
-    df1, l1 = layer1_hard_filter(df0, corp_map)
-    all_logs += l1
-    log(f"  → 통과 {len(df1)}개 | 탈락 {len(l1)}개")
-    if df1.empty:
-        return pd.DataFrame(), pd.DataFrame(all_logs, columns=['코드','종목명','사유'])
-
-    log("\n🟡 LAYER 2: 재무 점수 계산 중...")
-    df2 = layer2_finance_score(df1)
-    log("  → 완료")
-
-    log("\n🟢 LAYER 3: 유동성 필터...")
-    df3, l3 = layer3_liquidity(df2)
-    all_logs += l3
-    log(f"  → 통과 {len(df3)}개 | 탈락 {len(l3)}개")
-    if df3.empty:
-        return pd.DataFrame(), pd.DataFrame(all_logs, columns=['코드','종목명','사유'])
-
-    log("\n👥 LAYER 4: 주주 구조 분석 중...")
-    df4 = layer4_shareholder(df3)
-    log("  → 완료")
-
-    log("\n🎯 LAYER 5: 테마 분류 중...")
-    df5 = layer5_theme(df4)
-    log("  → 완료")
-
-    log("\n🔥 LAYER 6: 매집 패턴 감지 중...")
-    df6 = layer6_timing_accumulation(df5)
-    log("  → 완료")
-
-    log("\n🏁 종합 등급 산정 중...")
-    df_final = calc_final_grade(df6)
-    drop_cols = ['_dp','_dp3','_corp','영업이익_3년','부채_3년','자본_3년','납입자본금']
-    df_final  = df_final.drop(columns=[c for c in drop_cols if c in df_final.columns])
-    fail_df   = pd.DataFrame(all_logs, columns=['코드','종목명','탈락사유'])
-    log(f"\n✅ 완료! 최종 후보: {len(df_final)}개")
-    return df_final, fail_df
+if __name__ == "__main__":
+    run_pipeline()
