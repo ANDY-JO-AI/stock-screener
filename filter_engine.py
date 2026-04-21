@@ -120,12 +120,14 @@ def layer0_universe():
                 continue
             df = df[[code_col, name_col, cap_col]].copy()
             df.columns = ["code","name","marcap"]
+            df["code"] = df["code"].astype(str).str.zfill(6)
             df["market"] = mkt
             df["marcap"] = pd.to_numeric(df["marcap"], errors="coerce").fillna(0)
             df = df[df["marcap"] >= MIN_MARCAP]
             df = df[df["marcap"] <= MAX_MARCAP]
             # 제외 키워드
             exclude = ["스팩","SPAC","우","중국","홀딩스","리츠","기업인수"]
+            df["name"] = df["name"].astype(str)
             for kw in exclude:
                 df = df[~df["name"].str.contains(kw, na=False)]
             stocks.append(df)
