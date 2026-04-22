@@ -99,6 +99,10 @@ def fetch_all_news(stock_names: list = None) -> list:
     return all_news
 
 
+def load_news_data() -> list:
+    """저장된 뉴스 데이터 로드 (filter_engine에서 호출)"""
+    from data_store import load_news_data as _load
+    return _load()
 if __name__ == "__main__":
     news = fetch_all_news()
     print(f"총 {len(news)}건 수집")
