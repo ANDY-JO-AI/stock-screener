@@ -6,6 +6,7 @@ import FinanceDataReader as fdr
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from data_store import save_candidates
+from data_store import load_news_data as get_saved_news
 
 warnings.filterwarnings("ignore")
 
@@ -522,8 +523,11 @@ def analyze_stock(row: pd.Series, corp_map: dict,
 
 # ─── 파이프라인 실행 ────────────────────────────────────────────
 def run_pipeline():
-    from news_engine import load_news_data
-    news_list = load_news_data() if callable(load_news_data) else []
+try:
+    news_list = get_saved_news()
+except Exception:
+    news_list = []
+
 
     print("[PIPELINE] 유니버스 로드...")
     universe = layer0_universe()
