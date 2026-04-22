@@ -31,19 +31,31 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
 
 
 def fetch_rss(url: str, source: str) -> list:
-    """RSS 피드 파싱"""
+    """RSS 피드 파싱 — 인코딩 오류 방어 처리 포함"""
     items = []
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
-        r.encoding = r.apparent_encoding
-        root = ET.fromstring(r.content)
+        # XML 파싱 전 불량 문자 제거
+        content = r.content
+        # BOM 제거
+        if content.startswith(b'\xef\xbb\xbf'):
+            content = content[3:]
+        # 인코딩 선언 강제 UTF-8로 교체
+        content = content.replace(b'encoding="euc-kr"', b'encoding="utf-8"')
+        content = content.replace(b'encoding="EUC-KR"', b'encoding="utf-8"')
+        # 제어문자 제거 (XML 파싱 오류 원인)
+        import re as _re
+        content_str = content.decode("utf-8", errors="replace")
+        content_str = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', content_str)
+        content = content_str.encode("utf-8")
+
+        root = ET.fromstring(content)
         for item in root.findall(".//item")[:20]:
-            title   = item.findtext("title", "").strip()
-            link    = item.findtext("link",  "").strip()
-            pubdate = item.findtext("pubDate", "").strip()
-            desc    = item.findtext("description", "").strip()
-            # HTML 태그 제거
-            desc = re.sub(r"<[^>]+>", "", desc)[:200]
+            title   = item.findtext("title",       "").strip()
+            link    = item.findtext("link",         "").strip()
+            pubdate = item.findtext("pubDate",      "").strip()
+            desc    = item.findtext("description",  "").strip()
+            desc    = re.sub(r"<[^>]+>", "", desc)[:200]
             if title:
                 items.append({
                     "title":   title,
