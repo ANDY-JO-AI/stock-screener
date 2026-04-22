@@ -183,16 +183,21 @@ def load_kosdaq_universe() -> pd.DataFrame:
             return pd.DataFrame()
 
         # 컬럼 정규화
-        df.columns = [c.strip().lower() for c in df.columns]
-        rename_map = {}
+               # 컬럼명 출력 (디버깅용)
+        print(f"[L0] 실제 컬럼목록: {df.columns.tolist()}")
+
+        # 컬럼 자동 매핑
+        col_map = {}
         for c in df.columns:
-            if "시가총액" in c or "marcap" in c or "mktcap" in c:
-                rename_map[c] = "mktcap"
-            if "종목명" in c or "name" in c:
-                rename_map[c] = "name"
-            if "종목코드" in c or "code" in c or "symbol" in c:
-                rename_map[c] = "code"
-        df = df.rename(columns=rename_map)
+            cl = str(c).strip().lower()
+            if any(x in cl for x in ["시가총액", "marcap", "mktcap", "cap"]):
+                col_map[c] = "mktcap"
+            elif any(x in cl for x in ["종목명", "name"]):
+                col_map[c] = "name"
+            elif any(x in cl for x in ["종목코드", "code", "symbol", "ticker"]):
+                col_map[c] = "code"
+        df = df.rename(columns=col_map)
+
 
         required = {"code", "name", "mktcap"}
         missing = required - set(df.columns)
