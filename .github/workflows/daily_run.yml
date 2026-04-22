@@ -2,12 +2,14 @@ name: Daily Stock Analysis
 
 on:
   schedule:
-    - cron: '0 17 * * *'
+    - cron: '0 10 * * 1-5'  # 한국시간 19:00 (UTC 10:00), 평일만
   workflow_dispatch:
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,6 +23,12 @@ jobs:
           pip install pandas requests finance-datareader \
                       gspread google-auth beautifulsoup4 \
                       lxml openpyxl
+
+      - name: 시황 리포트 생성
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python market_report.py
 
       - name: 스크리너 실행
         env:
