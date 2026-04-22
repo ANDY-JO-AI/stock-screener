@@ -1,43 +1,103 @@
-name: Daily Stock Filter
+name: ANDY JO Stock AI — Daily Pipeline
 
 on:
   schedule:
-    # KST 19:00 = UTC 10:00
-    - cron: '0 10 * * 1-5'
-    # KST 19:30 — 시간외 특징주용 (DART 공시 수집)
-    - cron: '30 10 * * 1-5'
+    - cron: '50 23 * * 0-4'   # KST 08:50 (UTC 23:50 전일)
+    - cron: '30 6  * * 1-5'   # KST 15:30 (UTC 06:30)
+    - cron: '0  10 * * 1-5'   # KST 19:00 (UTC 10:00)
+    - cron: '30 10 * * 1-5'   # KST 19:30 (UTC 10:30)
   workflow_dispatch:
 
 jobs:
-  run-filter:
+  morning:
+    if: github.event.schedule == '50 23 * * 0-4'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run market report
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+      - name: 장전 뉴스·테마 수집
         env:
-          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: |
+          python news_engine.py
+          python theme_engine.py
+
+  close:
+    if: github.event.schedule == '30 6 * * 1-5'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+      - name: 장마감 시황·급등
+        env:
+          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          KIS_APP_KEY:        ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:     ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NO:     ${{ secrets.KIS_ACCOUNT_NO }}
         run: python market_report.py
 
-      - name: Run filter engine
+  screening:
+    if: github.event.schedule == '0 10 * * 1-5'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+      - name: 종목 스크리닝 L0-L6
         env:
-          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          KIS_APP_KEY:        ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:     ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NO:     ${{ secrets.KIS_ACCOUNT_NO }}
         run: python filter_engine.py
 
-      - name: Run after-hours collector
+  after_hours:
+    if: github.event.schedule == '30 10 * * 1-5'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+      - name: 시간외 특징주 + 텔레그램
         env:
-          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIS_APP_KEY:        ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:     ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NO:     ${{ secrets.KIS_ACCOUNT_NO }}
+          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python after_hours.py
+
+  manual:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.11' }
+      - run: pip install -r requirements.txt
+      - name: 전체 수동 실행
+        env:
+          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          KIS_APP_KEY:        ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET:     ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NO:     ${{ secrets.KIS_ACCOUNT_NO }}
+          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python news_engine.py
+          python theme_engine.py
+          python market_report.py
+          python filter_engine.py
+          python after_hours.py
