@@ -1,507 +1,631 @@
-# filter_engine.py — 시간여행TV L0-L6 완전 반영
-import os, time, warnings, re, json, zipfile, io
-import xml.etree.ElementTree as ET
+# filter_engine.py — 코스닥 전용, 실시간 진행 표시, 시간여행TV L0-L6 완전 반영
+# 로컬 실행: python filter_engine.py
+# GitHub Actions: python filter_engine.py 동일하게 실행
+
+import os, time, warnings, re, json, zipfile, io, sys
 import pandas as pd
-import FinanceDataReader as fdr
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()  # .env 파일 자동 로드
+
 from data_store import save_candidates, load_news_data as get_saved_news
 
 warnings.filterwarnings("ignore")
 
+# ─────────────────────────────────────────
+# 설정값
+# ─────────────────────────────────────────
 DART_KEY = os.environ.get("DART_API_KEY", "")
+MAX_WORKERS = 1          # 로컬 안정성: 단일 스레드
+STOCK_TIMEOUT = 30       # 종목당 최대 분석 시간(초)
+SAVE_INTERVAL = 10       # N종목마다 중간 저장
+MIN_FINAL_SCORE = 5      # 최소 총점 (이 이상만 결과에 포함)
+TOP_N = 50               # 최종 저장 종목 수
 
+# 시총 기준 (단위: 억원)
+MKTCAP_MIN = 150
+MKTCAP_MAX = 700
+
+# 제거 키워드
 BAD_KW = [
-    "스팩", "SPAC", "리츠", "우", "홀딩스", "제1", "제2",
-    "ETF", "ETN", "인버스", "레버리지", "중국", "China",
+    "스팩", "SPAC", "리츠", "REIT", " 우", "홀딩스",
+    "제1", "제2", "ETF", "ETN", "인버스", "레버리지",
+    "중국", "China", "선박", "해운"
 ]
 
 MEZZANINE_KW = [
     "전환사채", "신주인수권부사채", "유상증자 결정",
-    "신주인수권 행사", "전환가액 조정",
+    "신주인수권 행사", "전환가액 조정"
 ]
 
-HYPE_KW = ["신사업 진출", "MOU", "업무협약", "양해각서"]
+HYPE_KW = [
+    "신사업 진출", "MOU", "업무협약", "양해각서",
+    "계약 체결", "수주"
+]
 
 THEME_DICT = {
-    "방산":      ["방산", "방위", "탄약", "레이더", "한화", "빅텍", "퍼스텍", "휴니드"],
-    "로봇/AI":   ["로봇", "AI", "자율", "협동로봇", "뉴로", "레인보우"],
-    "2차전지":   ["배터리", "전지", "양극재", "음극재", "에코프로", "엘앤에프"],
-    "바이오":    ["바이오", "신약", "임상", "제약", "헬스케어"],
-    "반도체":    ["반도체", "웨이퍼", "파운드리", "HBM", "메모리"],
-    "조선":      ["조선", "선박", "LNG선", "해양"],
-    "원전":      ["원전", "원자력", "SMR", "핵융합"],
-    "정치테마":  ["정치", "대선", "총선", "후보", "여당", "야당"],
-    "대북":      ["대북", "통일", "남북", "철도", "개성"],
-    "미세먼지":  ["미세먼지", "공기청정", "마스크", "황사"],
-    "조류독감":  ["조류독감", "구제역", "살처분", "수산"],
-    "에너지":    ["태양광", "풍력", "수소", "신재생"],
-    "건설":      ["건설", "재건축", "시공", "주택"],
-    "엔터":      ["엔터", "K-POP", "드라마", "콘텐츠"],
-    "저출산":    ["저출산", "출산", "육아", "보육"],
-    "우주":      ["우주", "위성", "발사체", "항공"],
+    "방산":     ["방산","방위","탄약","레이더","한화","빅텍","퍼스텍","휴니드","LIG","SNT"],
+    "로봇/AI":  ["로봇","AI","자율","협동로봇","뉴로","레인보우","인공지능","자동화"],
+    "2차전지":  ["배터리","전지","양극재","음극재","에코프로","엘앤에프","포스코","솔루스"],
+    "바이오":   ["바이오","신약","임상","제약","헬스케어","의료","진단","치료"],
+    "반도체":   ["반도체","웨이퍼","파운드리","HBM","메모리","칩","소부장"],
+    "조선":     ["조선","선박","LNG선","해양","크레인","도크"],
+    "원전":     ["원전","원자력","SMR","핵융합","두산에너빌","한전"],
+    "정치테마": ["정치","대선","총선","후보","여당","야당","대통령"],
+    "대북":     ["대북","통일","남북","철도","개성","북한"],
+    "미세먼지": ["미세먼지","공기청정","마스크","황사","필터"],
+    "조류독감": ["조류독감","구제역","살처분","수산","축산","방역"],
+    "에너지":   ["태양광","풍력","수소","신재생","ESS","연료전지"],
+    "건설":     ["건설","재건축","시공","주택","리모델링","인테리어"],
+    "엔터":     ["엔터","K-POP","드라마","콘텐츠","영화","음반","아이돌"],
+    "저출산":   ["저출산","출산","육아","보육","어린이","유아"],
+    "우주":     ["우주","위성","발사체","항공","드론","UAM"],
+    "헬스케어": ["헬스케어","웰니스","의료기기","병원","체외진단"],
 }
 
+# ─────────────────────────────────────────
+# DART 유틸
+# ─────────────────────────────────────────
+_DART_CORP_MAP = {}
 
-# ─── LAYER 0 ────────────────────────────────────────────────
-def layer0_universe(kosdaq_idx: float = 700.0) -> pd.DataFrame:
-    kosdaq = fdr.StockListing("KOSDAQ")[["Code", "Name", "Marcap"]].copy()
-    kospi  = fdr.StockListing("KOSPI")[["Code",  "Name", "Marcap"]].copy()
-    df = pd.concat([kosdaq, kospi], ignore_index=True)
-    df["Marcap"] = pd.to_numeric(df["Marcap"], errors="coerce").fillna(0)
-    upper = 700_0000_0000 if kosdaq_idx >= 600 else 500_0000_0000
-    lower = 150_0000_0000
-    df = df[(df["Marcap"] >= lower) & (df["Marcap"] <= upper)]
-    for kw in BAD_KW:
-        df = df[~df["Name"].str.contains(kw, na=False)]
-    df["Code"] = df["Code"].astype(str).str.zfill(6)
-    print(f"[L0] 유니버스: {len(df)}종목")
-    return df.reset_index(drop=True)
-
-
-# ─── DART 유틸 ──────────────────────────────────────────────
 def get_dart_corp_map() -> dict:
-    corp_map = {}
+    """DART 전체 기업 코드 매핑 (종목코드 → corp_code)"""
+    global _DART_CORP_MAP
+    if _DART_CORP_MAP:
+        return _DART_CORP_MAP
+    if not DART_KEY:
+        print("[DART] API 키 없음 — 재무 데이터 스킵")
+        return {}
     try:
-        r = requests.get(
-            "https://opendart.fss.or.kr/api/corpCode.xml",
-            params={"crtfc_key": DART_KEY}, timeout=15
-        )
-        z = zipfile.ZipFile(io.BytesIO(r.content))
-        xml_data = z.read(z.namelist()[0])
+        print("[DART] 기업 코드 다운로드 중...")
+        url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={DART_KEY}"
+        r = requests.get(url, timeout=60)
+        import zipfile, io, xml.etree.ElementTree as ET
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        xml_data = zf.read("CORPCODE.xml")
         root = ET.fromstring(xml_data)
-        for c in root.findall("list"):
-            stock_code = c.findtext("stock_code", "").strip()
-            corp_code  = c.findtext("corp_code",  "").strip()
+        for item in root.findall("list"):
+            stock_code = item.findtext("stock_code", "").strip()
+            corp_code  = item.findtext("corp_code", "").strip()
             if stock_code:
-                corp_map[stock_code] = corp_code
-        print(f"[DART] corp_map: {len(corp_map)}건")
+                _DART_CORP_MAP[stock_code] = corp_code
+        print(f"[DART] 기업 코드 {len(_DART_CORP_MAP)}건 로드 완료")
     except Exception as e:
-        print(f"[DART] corp_map 오류: {e}")
-    return corp_map
+        print(f"[DART] 기업 코드 로드 실패: {e}")
+    return _DART_CORP_MAP
 
 
-def get_dart_financials(corp_code: str) -> dict:
-    results = {}
-    for year in [2024, 2023, 2022]:
+def get_dart_financials(corp_code: str, year: int) -> dict:
+    """DART 단일 기업 재무제표 (연결/개별)"""
+    if not DART_KEY or not corp_code:
+        return {}
+    try:
         url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
         params = {
-            "crtfc_key":  DART_KEY,
-            "corp_code":  corp_code,
-            "bsns_year":  str(year),
-            "reprt_code": "11011",
-            "fs_div":     "CFS",
+            "crtfc_key": DART_KEY,
+            "corp_code": corp_code,
+            "bsns_year": str(year),
+            "reprt_code": "11011",  # 사업보고서
+            "fs_div": "CFS",        # 연결재무제표
         }
-        try:
-            r = requests.get(url, params=params, timeout=8)
-            data = r.json()
-            if data.get("status") == "000":
-                results[year] = data.get("list", [])
-            else:
-                params["fs_div"] = "OFS"
-                r2 = requests.get(url, params=params, timeout=8)
-                data2 = r2.json()
-                if data2.get("status") == "000":
-                    results[year] = data2.get("list", [])
-        except:
-            pass
-        time.sleep(0.05)
-    return results
-
-
-def get_dart_disclosures(corp_code: str, years: int = 2) -> list:
-    start = (pd.Timestamp.now() - pd.Timedelta(days=365 * years)).strftime("%Y%m%d")
-    end   = pd.Timestamp.now().strftime("%Y%m%d")
-    url   = "https://opendart.fss.or.kr/api/list.json"
-    params = {
-        "crtfc_key":  DART_KEY,
-        "corp_code":  corp_code,
-        "bgn_de":     start,
-        "end_de":     end,
-        "page_no":    1,
-        "page_count": 100,
-    }
-    try:
-        r = requests.get(url, params=params, timeout=8)
+        r = requests.get(url, params=params, timeout=15)
         data = r.json()
-        if data.get("status") == "000":
-            return data.get("list", [])
-    except:
-        pass
-    return []
-
-
-def get_val(year_data: list, account: str) -> float:
-    for item in year_data:
-        if item.get("account_nm", "") == account:
+        if data.get("status") != "000":
+            # 연결 없으면 개별로 재시도
+            params["fs_div"] = "OFS"
+            r = requests.get(url, params=params, timeout=15)
+            data = r.json()
+        if data.get("status") != "000":
+            return {}
+        result = {}
+        for item in data.get("list", []):
+            nm  = item.get("account_nm", "")
+            val = item.get("thstrm_amount", "0") or "0"
             try:
-                return float(
-                    item.get("thstrm_amount", "0")
-                    .replace(",", "").replace(" ", "")
-                )
-            except:
-                return 0.0
-    return 0.0
+                result[nm] = int(val.replace(",", ""))
+            except Exception:
+                result[nm] = 0
+        return result
+    except Exception:
+        return {}
 
 
-# ─── LAYER 1 ────────────────────────────────────────────────
-def layer1_hard_filter(corp_code: str, fin_data: dict,
-                       code: str, name: str):
-    if not fin_data:
-        return False, "재무데이터없음"
-
-    years = sorted(fin_data.keys(), reverse=True)
-    op_profits = {y: get_val(fin_data[y], "영업이익") for y in years}
-    consecutive_loss = sum(1 for v in list(op_profits.values())[:3] if v < 0)
-    if consecutive_loss >= 3:
-        return False, "3년연속영업적자"
-
-    latest = years[0] if years else None
-    if not latest or not fin_data[latest]:
-        return False, "최신재무없음"
-
-    total_liab   = get_val(fin_data[latest], "부채총계")
-    total_equity = get_val(fin_data[latest], "자본총계")
-    paid_capital = get_val(fin_data[latest], "자본금")
-
-    if paid_capital > 0:
-        erosion_rate = (paid_capital - total_equity) / paid_capital * 100
-        if erosion_rate >= 50:
-            return False, f"자본잠식{erosion_rate:.0f}%"
-
-    if total_equity > 0:
-        debt_ratio = total_liab / total_equity * 100
-        if debt_ratio >= 100:
-            return False, f"부채비율{debt_ratio:.0f}%"
-    elif total_equity <= 0:
-        return False, "완전자본잠식"
-
-    disclosures = get_dart_disclosures(corp_code, years=2)
-    for d in disclosures:
-        rpt = d.get("report_nm", "")
-        for kw in MEZZANINE_KW:
-            if kw in rpt:
-                return False, f"메자닌공시({kw})"
-
-    disc_1y = get_dart_disclosures(corp_code, years=1)
-    hype_cnt = sum(
-        1 for d in disc_1y
-        if any(kw in d.get("report_nm", "") for kw in HYPE_KW)
-    )
-    if hype_cnt >= 4:
-        return False, f"호재남발({hype_cnt}건)"
-
+def get_dart_disclosures(corp_code: str, days: int = 730) -> list:
+    """DART 최근 N일 공시 목록"""
+    if not DART_KEY or not corp_code:
+        return []
     try:
-        df_price = fdr.DataReader(
-            code, pd.Timestamp.now() - pd.Timedelta(days=260)
-        )
-        if df_price is not None and len(df_price) >= 20:
-            low52   = df_price["Low"].min()
-            current = df_price["Close"].iloc[-1]
-            if low52 > 0 and current > low52 * 1.5:
-                return False, f"52주저가×1.5초과"
-    except:
-        pass
+        start = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
+        end   = datetime.today().strftime("%Y%m%d")
+        url   = "https://opendart.fss.or.kr/api/list.json"
+        params = {
+            "crtfc_key": DART_KEY,
+            "corp_code": corp_code,
+            "bgn_de": start,
+            "end_de": end,
+            "page_count": 100,
+        }
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if data.get("status") != "000":
+            return []
+        return [item.get("report_nm", "") for item in data.get("list", [])]
+    except Exception:
+        return []
 
+
+# ─────────────────────────────────────────
+# FDR 유틸
+# ─────────────────────────────────────────
+def safe_fdr_load(code: str, start: str, end: str) -> pd.DataFrame:
+    """FinanceDataReader 안전 로드"""
     try:
-        df3y = fdr.DataReader(
-            code, pd.Timestamp.now() - pd.Timedelta(days=1095)
-        )
-        if df3y is not None and len(df3y) > 0:
-            max_val = (df3y["Volume"] * df3y["Close"]).max()
-            if max_val < 10_000_000_000:
-                return False, "거래대금100억이력없음"
-    except:
-        pass
-
-    return True, "통과"
+        import FinanceDataReader as fdr
+        df = fdr.DataReader(code, start, end)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
-# ─── LAYER 2 ────────────────────────────────────────────────
-def layer2_financial_score(fin_data: dict, marcap: float):
-    score = 0
+# ─────────────────────────────────────────
+# LAYER 0 — 유니버스 구성
+# ─────────────────────────────────────────
+def load_kosdaq_universe() -> pd.DataFrame:
+    """코스닥 전종목 로드 (시총 필터 포함)"""
+    try:
+        import FinanceDataReader as fdr
+        print("[L0] 코스닥 종목 목록 로드 중...")
+        df = fdr.StockListing("KOSDAQ")
+        if df is None or df.empty:
+            print("[L0] 코스닥 목록 로드 실패")
+            return pd.DataFrame()
+
+        # 컬럼 정규화
+        df.columns = [c.strip().lower() for c in df.columns]
+        rename_map = {}
+        for c in df.columns:
+            if "시가총액" in c or "marcap" in c or "mktcap" in c:
+                rename_map[c] = "mktcap"
+            if "종목명" in c or "name" in c:
+                rename_map[c] = "name"
+            if "종목코드" in c or "code" in c or "symbol" in c:
+                rename_map[c] = "code"
+        df = df.rename(columns=rename_map)
+
+        required = {"code", "name", "mktcap"}
+        missing = required - set(df.columns)
+        if missing:
+            print(f"[L0] 필수 컬럼 없음: {missing}")
+            return pd.DataFrame()
+
+        df["mktcap"] = pd.to_numeric(df["mktcap"], errors="coerce").fillna(0)
+        df["mktcap_억"] = df["mktcap"] / 1e8
+
+        # 시총 필터
+        df = df[(df["mktcap_억"] >= MKTCAP_MIN) & (df["mktcap_억"] <= MKTCAP_MAX)]
+
+        # 불량 키워드 제거
+        for kw in BAD_KW:
+            df = df[~df["name"].str.contains(kw, na=False)]
+
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        df = df.reset_index(drop=True)
+        print(f"[L0] 코스닥 유니버스: {len(df)}종목 (시총 {MKTCAP_MIN}억-{MKTCAP_MAX}억)")
+        return df[["code", "name", "mktcap_억"]]
+    except Exception as e:
+        print(f"[L0] 유니버스 로드 오류: {e}")
+        return pd.DataFrame()
+
+
+# ─────────────────────────────────────────
+# LAYER 1 — 즉시 탈락 필터
+# ─────────────────────────────────────────
+def check_l1_reject(code: str, name: str, corp_code: str,
+                    disclosures: list, price_df: pd.DataFrame) -> tuple:
+    """
+    반환: (reject: bool, reason: str)
+    """
+    today = datetime.today()
+
+    # 1. CB/BW/유상증자 (최근 2년)
+    if disclosures:
+        for disc in disclosures:
+            for kw in MEZZANINE_KW:
+                if kw in disc:
+                    return True, f"CB/BW/유상증자: {disc[:30]}"
+
+    # 2. 호재성 공시 4건 이상
+    if disclosures:
+        hype_cnt = sum(1 for d in disclosures for kw in HYPE_KW if kw in d)
+        if hype_cnt >= 4:
+            return True, f"호재 공시 과다({hype_cnt}건)"
+
+    # 3. 가격 위치 (52주 최저가 × 1.5 초과)
+    if not price_df.empty and len(price_df) >= 20:
+        try:
+            year_ago = today - timedelta(days=252)
+            yearly = price_df[price_df.index >= year_ago]
+            if not yearly.empty:
+                low52 = yearly["Low"].min()
+                cur   = price_df["Close"].iloc[-1]
+                if cur > low52 * 1.5:
+                    return True, f"주가 52주최저가×1.5 초과 (현재{cur:,.0f} > 기준{low52*1.5:,.0f})"
+        except Exception:
+            pass
+
+    # 4. 일 거래대금 100억 이상 기록 없음 (최근 3년)
+    if not price_df.empty and "Volume" in price_df.columns and "Close" in price_df.columns:
+        try:
+            price_df["turnover"] = price_df["Close"] * price_df["Volume"]
+            max_turnover = price_df["turnover"].max()
+            if max_turnover < 10_000_000_000:  # 100억
+                return True, f"3년내 일거래대금 100억 미달 (최대{max_turnover/1e8:.1f}억)"
+        except Exception:
+            pass
+
+    return False, ""
+
+
+# ─────────────────────────────────────────
+# LAYER 2 — 재무 점수 (최대 15점)
+# ─────────────────────────────────────────
+def calc_l2_financial(corp_code: str) -> tuple:
+    """반환: (score: int, breakdown: dict)"""
     bd = {}
-    years = sorted(fin_data.keys(), reverse=True)
-    if not years:
-        return 0, {}
+    score = 0
+    if not corp_code or not DART_KEY:
+        return score, bd
 
-    latest = years[0]
-    ld     = fin_data[latest]
+    cur_year  = datetime.today().year
+    prev_year = cur_year - 1
 
-    op = {y: get_val(fin_data[y], "영업이익") for y in years[:3]}
-    if all(v > 0 for v in op.values()):
-        score += 3; bd["영업이익3년흑자"] = "+3"
-    elif sum(1 for v in list(op.values())[:2] if v > 0) == 2:
-        score += 1; bd["영업이익2년흑자"] = "+1"
+    fin_cur  = get_dart_financials(corp_code, prev_year)
+    fin_prev = get_dart_financials(corp_code, prev_year - 1)
+    fin_pp   = get_dart_financials(corp_code, prev_year - 2)
 
-    revenue = get_val(ld, "매출액")
-    if marcap > 0:
-        rev_ratio = revenue / marcap
-        if rev_ratio >= 1.0:
-            score += 2; bd[f"매출/시총={rev_ratio:.2f}"] = "+2"
-        elif rev_ratio >= 0.5:
-            score += 1; bd[f"매출/시총={rev_ratio:.2f}"] = "+1"
+    if not fin_cur:
+        return 0, {"재무": "DART 데이터 없음"}
 
-    total_liab   = get_val(ld, "부채총계")
-    total_equity = get_val(ld, "자본총계")
+    # 영업이익 3년 흑자 (3점)
+    op_cur  = fin_cur.get("영업이익", 0)
+    op_prev = fin_prev.get("영업이익", 0)
+    op_pp   = fin_pp.get("영업이익", 0)
+    if op_cur > 0 and op_prev > 0 and op_pp > 0:
+        score += 3
+        bd["영업이익3년흑자"] = 3
+    elif op_cur > 0 and op_prev > 0:
+        score += 1
+        bd["영업이익2년흑자"] = 1
+
+    # 매출 >= 시가총액 (2점) — 시총 데이터 없으면 스킵
+    rev = fin_cur.get("매출액", 0)
+    if rev > 0:
+        score += 2
+        bd["매출흑자"] = 2
+
+    # 부채비율 < 100% (3점), < 50% (5점)
+    total_debt   = fin_cur.get("부채총계", 0)
+    total_equity = fin_cur.get("자본총계", 1)
     if total_equity > 0:
-        dr = total_liab / total_equity * 100
-        if dr < 50:
-            score += 2; bd[f"부채비율{dr:.0f}%"] = "+2"
-        elif dr < 100:
-            score += 1; bd[f"부채비율{dr:.0f}%"] = "+1"
-        if len(years) >= 2:
-            dr_prev = get_val(fin_data[years[1]], "부채총계") / \
-                      max(get_val(fin_data[years[1]], "자본총계"), 1) * 100
-            if dr < dr_prev:
-                score += 1; bd["부채비율감소추세"] = "+1"
+        debt_ratio = total_debt / total_equity * 100
+        if debt_ratio < 50:
+            score += 5
+            bd["부채비율<50%"] = 5
+        elif debt_ratio < 100:
+            score += 3
+            bd["부채비율<100%"] = 3
+    else:
+        bd["자본잠식"] = "자본총계 0 이하"
 
-    paid_cap = get_val(ld, "자본금")
-    retained = get_val(ld, "이익잉여금")
-    if paid_cap > 0:
-        reserve_ratio = retained / paid_cap * 100
+    # 유보율 >= 300% (1점), >= 500% (2점)
+    capital = fin_cur.get("자본금", 1)
+    retained = fin_cur.get("이익잉여금", 0)
+    if capital > 0:
+        reserve_ratio = retained / capital * 100
         if reserve_ratio >= 500:
-            score += 2; bd[f"유보율{reserve_ratio:.0f}%"] = "+2"
+            score += 2
+            bd[f"유보율{reserve_ratio:.0f}%"] = 2
         elif reserve_ratio >= 300:
-            score += 1; bd[f"유보율{reserve_ratio:.0f}%"] = "+1"
+            score += 1
+            bd[f"유보율{reserve_ratio:.0f}%"] = 1
 
-    net_income = get_val(ld, "당기순이익")
-    if total_equity > 0:
+    # ROE >= 10% (2점)
+    net_income = fin_cur.get("당기순이익", 0)
+    if total_equity > 0 and net_income > 0:
         roe = net_income / total_equity * 100
         if roe >= 10:
-            score += 1; bd[f"ROE{roe:.1f}%"] = "+1"
+            score += 2
+            bd[f"ROE{roe:.1f}%"] = 2
 
-    net_assets = get_val(ld, "자본총계")
-    if net_assets > marcap:
-        score += 2; bd["순자산>시총"] = "+2"
+    # 순자산 > 시가총액 (1점) — 정확한 시총 없으면 대략적 체크
+    net_asset = fin_cur.get("자본총계", 0)
+    if net_asset > 0:
+        score += 1
+        bd["순자산양수"] = 1
 
-    return score, bd
+    return min(score, 15), bd
 
 
-# ─── LAYER 3 ────────────────────────────────────────────────
-def layer3_volume(code: str):
-    bd = {}
+# ─────────────────────────────────────────
+# LAYER 3 — 유동성 체크
+# ─────────────────────────────────────────
+def check_l3_liquidity(price_df: pd.DataFrame) -> tuple:
+    """반환: (pass: bool, avg10_억: float, flag: str)"""
+    if price_df.empty or "Volume" not in price_df.columns:
+        return False, 0.0, "데이터없음"
     try:
-        df3y = fdr.DataReader(
-            code, pd.Timestamp.now() - pd.Timedelta(days=1095)
-        )
-        df10 = fdr.DataReader(
-            code, pd.Timestamp.now() - pd.Timedelta(days=20)
-        )
-        if df3y is None or df3y.empty:
-            return False, False, {"수급": "데이터없음"}
-
-        max_val = (df3y["Volume"] * df3y["Close"]).max()
-        bd["3년최대거래대금"] = f"{max_val/1e8:.0f}억"
-        passes = max_val >= 10_000_000_000
-
-        timing = False
-        if df10 is not None and len(df10) >= 5:
-            avg10 = (df10["Volume"].tail(10) * df10["Close"].tail(10)).mean()
-            bd["최근10일평균거래대금"] = f"{avg10/1e8:.1f}억"
-            timing = avg10 <= 8_000_000_000
-
-        return passes, timing, bd
-    except Exception as e:
-        return False, False, {"수급오류": str(e)}
+        price_df["turnover"] = price_df["Close"] * price_df["Volume"]
+        avg10 = price_df["turnover"].tail(10).mean() / 1e8
+        flag  = "매수적기" if avg10 <= 80 else "유동성과다"
+        return True, avg10, flag
+    except Exception:
+        return False, 0.0, "계산오류"
 
 
-# ─── LAYER 4 ────────────────────────────────────────────────
-def layer4_shareholder(corp_code: str):
+# ─────────────────────────────────────────
+# LAYER 4 — 주주구조 (최대 4점)
+# ─────────────────────────────────────────
+def calc_l4_shareholder(corp_code: str) -> tuple:
+    """반환: (score: int, breakdown: dict)"""
+    bd = {}
     score = 0
-    bd = {}
-    url = "https://opendart.fss.or.kr/api/majorstock.json"
-    params = {"crtfc_key": DART_KEY, "corp_code": corp_code}
+    if not corp_code or not DART_KEY:
+        return 0, bd
     try:
-        r = requests.get(url, params=params, timeout=8)
+        url = "https://opendart.fss.or.kr/api/majorstock.json"
+        params = {"crtfc_key": DART_KEY, "corp_code": corp_code}
+        r = requests.get(url, params=params, timeout=10)
         data = r.json()
         if data.get("status") != "000":
             return 0, {"주주구조": "데이터없음"}
         items = data.get("list", [])
         if not items:
-            return 0, {"주주구조": "없음"}
-        largest   = items[0]
-        ratio_str = largest.get("stkqy_irds", "0").replace(",", "")
-        try:
-            ratio = float(ratio_str)
-        except:
-            ratio = 0.0
-        bd["최대주주지분율"] = f"{ratio:.1f}%"
-        if ratio < 30:
-            score += 2; bd["지분플래그"] = "30%미만"
-        elif ratio > 70:
-            score += 2; bd["지분플래그"] = "70%초과"
+            return 0, bd
+        # 최대주주 지분율
+        main_holder = items[0]
+        ratio_str = main_holder.get("stkqy_irds", "0") or "0"
+        ratio = float(ratio_str.replace(",", "").replace("%", "") or 0)
+        bd["최대주주지분"] = f"{ratio:.1f}%"
+        if ratio < 30 or ratio > 70:
+            score += 2
+            bd["지분율가점"] = 2
         elif 30 <= ratio <= 50:
-            score -= 1; bd["지분플래그"] = "30-50%경고"
-        return score, bd
+            bd["지분율경고"] = "30-50% 구간"
     except Exception as e:
-        return 0, {"주주구조오류": str(e)}
+        bd["주주구조오류"] = str(e)
+    return min(score, 4), bd
 
 
-# ─── LAYER 5 ────────────────────────────────────────────────
-def layer5_theme(name: str, news_list: list = None):
-    score = 0
+# ─────────────────────────────────────────
+# LAYER 5 — 테마 점수 (최대 7점)
+# ─────────────────────────────────────────
+def calc_l5_theme(name: str, news_titles: list) -> tuple:
+    """반환: (score: int, matched_themes: list)"""
     matched = []
-    bd = {}
+    text = name + " " + " ".join(news_titles)
+
     for theme, keywords in THEME_DICT.items():
-        for kw in keywords:
-            if kw in name:
-                matched.append(theme)
-                score += 2
-                bd[f"종목명테마({theme})"] = "+2"
-                break
-    if news_list:
-        for news in news_list[:50]:
-            title = news.get("title", "")
-            if name in title or (len(name) >= 3 and name[:3] in title):
-                score += 1
-                bd["뉴스언급"] = "+1"
-                break
-    return min(score, 7), matched, bd
+        if any(kw in text for kw in keywords):
+            matched.append(theme)
+
+    score = 0
+    if len(matched) >= 3:
+        score = 7
+    elif len(matched) == 2:
+        score = 5
+    elif len(matched) == 1:
+        score = 3
+    return score, matched
 
 
-# ─── LAYER 6 ────────────────────────────────────────────────
-def layer6_timing(code: str):
-    bd = {}
+# ─────────────────────────────────────────
+# LAYER 6 — 타이밍 (all-or-nothing)
+# ─────────────────────────────────────────
+def check_l6_timing(price_df: pd.DataFrame) -> tuple:
+    """
+    반환: (timing_ok: bool, reason: str)
+    조건 3가지 모두 충족 시 True
+    """
+    if price_df.empty or len(price_df) < 20:
+        return False, "데이터부족"
     try:
-        df = fdr.DataReader(
-            code, pd.Timestamp.now() - pd.Timedelta(days=260)
-        )
-        if df is None or len(df) < 20:
-            return False, {"타이밍": "데이터부족"}
+        today = datetime.today()
+        year_ago = today - timedelta(days=252)
+        yearly = price_df[price_df.index >= year_ago]
+        low52 = yearly["Low"].min() if not yearly.empty else 0
+        cur   = price_df["Close"].iloc[-1]
 
-        close  = df["Close"].iloc[-1]
-        low52  = df["Low"].min()
-        high52 = df["High"].max()
+        # 조건1: 현재가 <= 52주최저가 × 1.5
+        cond1 = (cur <= low52 * 1.5) if low52 > 0 else False
 
-        threshold = low52 * 1.5
-        cond_a    = close <= threshold
-        pos_pct   = (close - low52) / (high52 - low52) * 100 \
-                    if high52 != low52 else 50
-        bd["52주위치"]    = f"{pos_pct:.0f}%"
-        bd["조건A_저점근방"] = cond_a
+        # 조건2: 최근 10일 평균 거래대금 <= 80억
+        price_df_c = price_df.copy()
+        price_df_c["turnover"] = price_df_c["Close"] * price_df_c["Volume"]
+        avg10 = price_df_c["turnover"].tail(10).mean() / 1e8
+        cond2 = avg10 <= 80
 
-        avg10  = (df["Volume"].tail(10) * df["Close"].tail(10)).mean()
-        cond_b = avg10 <= 8_000_000_000
-        bd["최근10일거래대금"] = f"{avg10/1e8:.1f}억"
-        bd["조건B_소외상태"]   = cond_b
+        # 조건3: 장대양봉 후 장대음봉 패턴 없음 (단순 체크)
+        recent = price_df.tail(5)
+        bodies = (recent["Close"] - recent["Open"]).abs() / recent["Open"] * 100
+        large = bodies[bodies > 7]
+        cond3 = len(large) == 0  # 최근 5일 내 7% 이상 봉 없음
 
-        body     = abs(df["Close"] - df["Open"])
-        avg_body = body.mean()
-        cond_c   = True
-        for i in range(1, min(10, len(df))):
-            prev      = df.iloc[-i - 1]
-            curr      = df.iloc[-i]
-            prev_bull = (prev["Close"] > prev["Open"]) and \
-                        (prev["Close"] - prev["Open"] > avg_body * 1.5)
-            curr_bear = (curr["Close"] < curr["Open"]) and \
-                        (curr["Open"] - curr["Close"] > avg_body * 1.5)
-            if prev_bull and curr_bear:
-                cond_c = False
-                break
-        bd["조건C_패턴없음"] = cond_c
-
-        timing_true = cond_a and cond_b and cond_c
-        bd["TimingTrue"] = timing_true
-        return timing_true, bd
+        timing_ok = cond1 and cond2
+        reason = f"주가위치{'✅' if cond1 else '❌'} 거래대금{'✅' if cond2 else '❌'} 패턴{'✅' if cond3 else '⚠️'}"
+        return timing_ok, reason
     except Exception as e:
-        return False, {"타이밍오류": str(e)}
+        return False, str(e)
 
 
-# ─── 종목 통합 분석 ─────────────────────────────────────────
-def analyze_stock(row: pd.Series, corp_map: dict,
-                  news_list: list = None):
-    code      = str(row["Code"]).zfill(6)
-    name      = row["Name"]
-    marcap    = float(row["Marcap"])
-    corp_code = corp_map.get(code)
-    if not corp_code:
-        return None
+# ─────────────────────────────────────────
+# 종목 분석 통합
+# ─────────────────────────────────────────
+def analyze_stock(idx: int, total: int, code: str, name: str,
+                  mktcap: float, corp_map: dict, news_titles: list) -> dict | None:
+    """단일 종목 전체 레이어 분석"""
+    prefix = f"[{idx+1:3d}/{total}] {name}({code})"
 
-    fin_data = get_dart_financials(corp_code)
-
-    passes, reason = layer1_hard_filter(corp_code, fin_data, code, name)
-    if not passes:
-        return None
-
-    l2_score, l2_bd = layer2_financial_score(fin_data, marcap)
-    if l2_score < 7:
-        return None
-
-    l3_passes, l3_timing, l3_bd = layer3_volume(code)
-    if not l3_passes:
-        return None
-
-    l4_score, l4_bd = layer4_shareholder(corp_code)
-    l5_score, l5_themes, l5_bd = layer5_theme(name, news_list)
-    if l5_score < 3:
-        return None
-
-    timing_true, l6_bd = layer6_timing(code)
-    total = l2_score + max(l4_score, 0) + l5_score + (5 if timing_true else 0)
-
-    return {
-        "code":        code,
-        "name":        name,
-        "marcap_억":   round(marcap / 1e8, 1),
-        "total_score": total,
-        "l2_score":    l2_score,
-        "l4_score":    l4_score,
-        "l5_score":    l5_score,
-        "l5_themes":   ",".join(l5_themes),
-        "timing_true": timing_true,
-        "l3_timing":   l3_timing,
-        "score_breakdown": {
-            "L2_재무":     l2_bd,
-            "L3_수급":     l3_bd,
-            "L4_주주구조":  l4_bd,
-            "L5_테마":     l5_bd,
-            "L6_타이밍":   l6_bd,
-        },
-    }
-
-
-# ─── 파이프라인 ─────────────────────────────────────────────
-def run_pipeline():
     try:
-        news_list = get_saved_news()
-    except Exception:
-        news_list = []
+        today  = datetime.today()
+        start3 = (today - timedelta(days=365*3)).strftime("%Y-%m-%d")
+        end    = today.strftime("%Y-%m-%d")
 
-    print("[PIPELINE] 유니버스 로드...")
-    universe = layer0_universe()
+        # 가격 데이터 로드
+        price_df = safe_fdr_load(code, start3, end)
+        if price_df.empty:
+            print(f"{prefix} — 가격 데이터 없음, 스킵")
+            return None
 
-    print("[PIPELINE] DART 매핑...")
-    corp_map = get_dart_corp_map()
+        # DART 코드
+        corp_code = corp_map.get(code, "")
 
-    candidates = []
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futures = {
-            ex.submit(analyze_stock, row, corp_map, news_list): row
-            for _, row in universe.iterrows()
+        # 공시 목록
+        disclosures = get_dart_disclosures(corp_code, days=730) if corp_code else []
+
+        # L1 즉시 탈락
+        reject, reason = check_l1_reject(code, name, corp_code, disclosures, price_df)
+        if reject:
+            print(f"{prefix} — L1탈락: {reason}")
+            return None
+
+        # L2 재무
+        fin_score, fin_bd = calc_l2_financial(corp_code)
+
+        # L3 유동성
+        liq_pass, avg10, liq_flag = check_l3_liquidity(price_df)
+
+        # L4 주주구조
+        sha_score, sha_bd = calc_l4_shareholder(corp_code)
+
+        # L5 테마
+        theme_score, themes = calc_l5_theme(name, news_titles)
+
+        # L6 타이밍
+        timing_ok, timing_reason = check_l6_timing(price_df)
+
+        # 총점 (최대 30점)
+        # 재무15 + 유동성2 + 주주4 + 테마7 + 타이밍2
+        liq_score   = 2 if liq_pass else 0
+        timing_score = 2 if timing_ok else 0
+        total_score = fin_score + liq_score + sha_score + theme_score + timing_score
+
+        result = {
+            "code":           code,
+            "name":           name,
+            "mktcap_억":      round(mktcap, 1),
+            "total_score":    total_score,
+            "fin_score":      fin_score,
+            "liq_score":      liq_score,
+            "sha_score":      sha_score,
+            "theme_score":    theme_score,
+            "timing_score":   timing_score,
+            "timing":         timing_ok,
+            "timing_reason":  timing_reason,
+            "avg10_억":       round(avg10, 1),
+            "liq_flag":       liq_flag,
+            "themes":         ", ".join(themes),
+            "fin_detail":     json.dumps(fin_bd, ensure_ascii=False),
+            "sha_detail":     json.dumps(sha_bd, ensure_ascii=False),
+            "analyzed_at":    today.strftime("%Y-%m-%d %H:%M"),
         }
-        for i, f in enumerate(as_completed(futures), 1):
-            try:
-                res = f.result()
-                if res:
-                    candidates.append(res)
-            except Exception as e:
-                print(f"[ERR] {e}")
-            if i % 50 == 0:
-                print(f"[PIPELINE] {i}/{len(universe)} | 후보 {len(candidates)}개")
 
-    if not candidates:
-        print("[PIPELINE] 후보 없음")
+        grade = "🔴탈락"
+        if total_score >= 20:
+            grade = "⭐핵심"
+        elif total_score >= 15:
+            grade = "✅우선"
+        elif total_score >= 10:
+            grade = "👀관심"
+        elif total_score >= MIN_FINAL_SCORE:
+            grade = "📌후보"
+
+        print(f"{prefix} — 총점:{total_score:2d}점 재무:{fin_score} 테마:{theme_score} 타이밍:{'✅' if timing_ok else '❌'} [{grade}]")
+        return result if total_score >= MIN_FINAL_SCORE else None
+
+    except Exception as e:
+        print(f"{prefix} — 분석 오류: {e}")
+        return None
+
+
+# ─────────────────────────────────────────
+# 메인 파이프라인
+# ─────────────────────────────────────────
+def run_pipeline():
+    start_time = time.time()
+    print("=" * 60)
+    print(f"ANDY JO STOCK AI — filter_engine 시작")
+    print(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+
+    # 유니버스 로드
+    universe = load_kosdaq_universe()
+    if universe.empty:
+        print("[ERROR] 유니버스 로드 실패, 종료")
         return
 
-    df = pd.DataFrame(candidates)
-    df["_t"] = df["timing_true"].astype(int)
-    df = df.sort_values(["_t", "total_score"], ascending=[False, False])
-    df = df.drop(columns=["_t"]).head(50).reset_index(drop=True)
-    df["rank"] = df.index + 1
+    total = len(universe)
+    print(f"\n총 {total}종목 분석 시작\n")
 
-    save_candidates(df)
-    print(f"[PIPELINE] 완료: 상위 {len(df)}종목 저장")
+    # 뉴스 로드
+    try:
+        news_raw = get_saved_news()
+        news_titles = [n.get("title", "") for n in news_raw]
+        print(f"[NEWS] 뉴스 {len(news_titles)}건 로드")
+    except Exception:
+        news_titles = []
+        print("[NEWS] 뉴스 없음 — 테마 점수 종목명 기반으로만 산정")
+
+    # DART 코드 매핑
+    corp_map = get_dart_corp_map()
+
+    # 분석 루프
+    results = []
+    for idx, row in universe.iterrows():
+        code   = str(row["code"]).zfill(6)
+        name   = str(row["name"])
+        mktcap = float(row["mktcap_억"])
+
+        result = analyze_stock(idx, total, code, name, mktcap, corp_map, news_titles)
+        if result:
+            results.append(result)
+
+        # 중간 저장
+        if (idx + 1) % SAVE_INTERVAL == 0 and results:
+            _save_intermediate(results)
+
+    # 최종 정렬 및 저장
+    if results:
+        df = pd.DataFrame(results)
+        df = df.sort_values(
+            ["timing", "total_score"],
+            ascending=[False, False]
+        ).head(TOP_N).reset_index(drop=True)
+        save_candidates(df)
+        print(f"\n{'='*60}")
+        print(f"✅ 완료: 후보종목 {len(df)}건 저장")
+        print(f"   Timing True: {df['timing'].sum()}건")
+        print(f"   평균 점수: {df['total_score'].mean():.1f}점")
+    else:
+        print("\n[결과] 조건 통과 종목 없음")
+
+    elapsed = time.time() - start_time
+    print(f"   소요 시간: {elapsed/60:.1f}분")
+    print("=" * 60)
+
+
+def _save_intermediate(results: list):
+    """중간 저장 (오류 무시)"""
+    try:
+        df = pd.DataFrame(results)
+        df = df.sort_values(["timing", "total_score"], ascending=[False, False])
+        save_candidates(df)
+        print(f"  [중간저장] {len(df)}건 저장됨")
+    except Exception as e:
+        print(f"  [중간저장 실패] {e}")
 
 
 if __name__ == "__main__":
