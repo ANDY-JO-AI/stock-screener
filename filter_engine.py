@@ -6,9 +6,7 @@ import os, time, warnings, re, json, zipfile, io, sys
 import pandas as pd
 import requests
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
-load_dotenv()  # .env 파일 자동 로드
 
 from data_store import save_candidates, load_news_data as get_saved_news
 
