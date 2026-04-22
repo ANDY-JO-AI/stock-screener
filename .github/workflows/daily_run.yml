@@ -1,37 +1,43 @@
-name: Daily Stock Analysis
+name: Daily Stock Filter
 
 on:
   schedule:
-    - cron: '0 10 * * 1-5'  # 한국시간 19:00 (UTC 10:00), 평일만
+    # KST 19:00 = UTC 10:00
+    - cron: '0 10 * * 1-5'
+    # KST 19:30 — 시간외 특징주용 (DART 공시 수집)
+    - cron: '30 10 * * 1-5'
   workflow_dispatch:
 
 jobs:
-  analyze:
+  run-filter:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
-      - name: Python 설정
-        uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: 라이브러리 설치
-        run: |
-          pip install pandas requests finance-datareader \
-                      gspread google-auth beautifulsoup4 \
-                      lxml openpyxl
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: 시황 리포트 생성
+      - name: Run market report
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: python market_report.py
 
-      - name: 스크리너 실행
+      - name: Run filter engine
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: python filter_engine.py
+
+      - name: Run after-hours collector
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python after_hours.py
