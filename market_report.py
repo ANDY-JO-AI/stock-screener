@@ -1,288 +1,221 @@
-import requests
+import os, json, requests
+from datetime import datetime
 from bs4 import BeautifulSoup
-import pandas as pd
-import json, time, os
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import gspread
+from google.oauth2.service_account import Credentials
 
-try:
-    import FinanceDataReader as fdr
-except:
-    fdr = None
+SHEETS_ID = "1OqRboKwx7X0-3W67_raZyV2ZjcQ_G7ylHilf7SgAU88"
+SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-from data_store import save_market_report
-
-TODAY = datetime.today()
-TODAY_STR = TODAY.strftime('%Y-%m-%d')
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-
-# ──────────────────────────────────────────
-# 1. KRX 상한가/급등주 수집
-# ──────────────────────────────────────────
-def fetch_krx_top_movers():
-    result = {"상한가": [], "급등주": []}
-    try:
-        if fdr is None:
-            return result
-        for mkt in ["KOSPI", "KOSDAQ"]:
-            df = fdr.StockListing(mkt)
-            if df is None or df.empty:
-                continue
-            df.columns = [c.strip() for c in df.columns]
-            chg_col = next((c for c in df.columns if "등락" in c or "Change" in c or "change" in c), None)
-            name_col = next((c for c in df.columns if "종목명" in c or "Name" in c), None)
-            code_col = next((c for c in df.columns if "코드" in c or "Code" in c or "Symbol" in c), None)
-            if not all([chg_col, name_col, code_col]):
-                continue
-            df["_chg"] = pd.to_numeric(df[chg_col], errors="coerce").fillna(0)
-            df["_name"] = df[name_col].astype(str)
-            df["_code"] = df[code_col].astype(str).str.zfill(6)
-            df["_mkt"] = mkt
-            upper = df[df["_chg"] >= 29.0]
-            for _, r in upper.iterrows():
-                result["상한가"].append({
-                    "종목명": r["_name"], "코드": r["_code"],
-                    "등락률": r["_chg"], "시장": mkt
-                })
-            top = df[df["_chg"] >= 5.0].nlargest(20, "_chg")
-            for _, r in top.iterrows():
-                result["급등주"].append({
-                    "종목명": r["_name"], "코드": r["_code"],
-                    "등락률": r["_chg"], "시장": mkt
-                })
-    except Exception as e:
-        print(f"[KRX 수집 오류] {e}")
-    return result
-
-# ──────────────────────────────────────────
-# 2. 네이버 금융 뉴스 크롤링
-# ──────────────────────────────────────────
-def fetch_naver_news(stock_code: str, stock_name: str) -> list:
-    news_list = []
-    try:
-        url = f"https://finance.naver.com/item/news_news.nhn?code={stock_code}&page=1"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "lxml")
-        rows = soup.select("table.type5 tr")
-        for row in rows[:3]:
-            title_tag = row.select_one("td.title a")
-            if title_tag:
-                news_list.append(title_tag.get_text(strip=True))
-    except Exception as e:
-        print(f"[네이버 뉴스 {stock_name}] {e}")
-    return news_list
-
-# ──────────────────────────────────────────
-# 3. 매일경제 증권 시황 크롤링
-# ──────────────────────────────────────────
-def fetch_mk_market():
-    result = []
-    try:
-        url = "https://stock.mk.co.kr/news/marketNews"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "lxml")
-        articles = soup.select("ul.news_list li")[:5]
-        for a in articles:
-            title = a.select_one("a")
-            if title:
-                result.append(title.get_text(strip=True))
-    except Exception as e:
-        print(f"[매일경제 크롤링 오류] {e}")
-    return result
-
-# ──────────────────────────────────────────
-# 4. 한국경제 증권 크롤링
-# ──────────────────────────────────────────
-def fetch_hankyung_market():
-    result = []
-    try:
-        url = "https://www.hankyung.com/finance/stock-market"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "lxml")
-        articles = soup.select("ul.news-list li")[:5]
-        for a in articles:
-            title = a.select_one("a")
-            if title:
-                result.append(title.get_text(strip=True))
-    except Exception as e:
-        print(f"[한국경제 크롤링 오류] {e}")
-    return result
-
-# ──────────────────────────────────────────
-# 5. 연합뉴스 경제 크롤링
-# ──────────────────────────────────────────
-def fetch_yonhap_market():
-    result = []
-    try:
-        url = "https://www.yna.co.kr/economy/stock"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "lxml")
-        articles = soup.select("div.item-box01 strong.tit-news")[:5]
-        for a in articles:
-            result.append(a.get_text(strip=True))
-    except Exception as e:
-        print(f"[연합뉴스 크롤링 오류] {e}")
-    return result
-
-# ──────────────────────────────────────────
-# 6. DART 당일 공시 수집
-# ──────────────────────────────────────────
-def fetch_dart_today():
-    DART_API_KEY = os.environ.get("DART_API_KEY", "7d2191837b9373fc6f049fd6fa30d7678f2f96f6")
-    result = {"호재": [], "악재": [], "중립": []}
-    try:
-        url = "https://opendart.fss.or.kr/api/list.json"
-        params = {
-            "crtfc_key": DART_API_KEY,
-            "bgn_de": TODAY.strftime('%Y%m%d'),
-            "end_de": TODAY.strftime('%Y%m%d'),
-            "page_count": 100
-        }
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-        if data.get("status") == "000":
-            for item in data.get("list", []):
-                title = item.get("report_nm", "")
-                corp = item.get("corp_name", "")
-                entry = {"종목명": corp, "공시": title}
-                bad_kw = ["전환사채", "신주인수권", "유상증자", "전환가액 조정", "사모"]
-                good_kw = ["계약", "수주", "MOU", "공급", "납품", "자사주", "배당"]
-                if any(k in title for k in bad_kw):
-                    result["악재"].append(entry)
-                elif any(k in title for k in good_kw):
-                    result["호재"].append(entry)
-                else:
-                    result["중립"].append(entry)
-    except Exception as e:
-        print(f"[DART 당일 공시 오류] {e}")
-    return result
-
-# ──────────────────────────────────────────
-# 7. 시장 지수 수집
-# ──────────────────────────────────────────
-def fetch_index_summary():
-    result = {}
-    try:
-        if fdr is None:
-            return result
-        for name, code in [("KOSPI", "KS11"), ("KOSDAQ", "KQ11")]:
-            df = fdr.DataReader(code,
-                (TODAY - timedelta(days=5)).strftime('%Y-%m-%d'),
-                TODAY.strftime('%Y-%m-%d'))
-            if df is not None and len(df) >= 2:
-                close = df["Close"].iloc[-1]
-                prev  = df["Close"].iloc[-2]
-                chg   = (close - prev) / prev * 100
-                result[name] = {
-                    "지수": round(close, 2),
-                    "등락률": round(chg, 2),
-                    "전일": round(prev, 2)
-                }
-    except Exception as e:
-        print(f"[지수 수집 오류] {e}")
-    return result
-
-# ──────────────────────────────────────────
-# 8. 테마 자동 분류
-# ──────────────────────────────────────────
-THEME_KEYWORDS = {
-    "🏛️정치/선거": ["선거", "대선", "총선", "정권", "국회", "여당", "야당"],
-    "🛡️방산/안보": ["방산", "방위", "무기", "군", "안보", "국방", "미사일", "나토", "전쟁"],
-    "🤖AI/로봇": ["인공지능", "AI", "로봇", "자동화", "옵티머스", "휴머노이드"],
-    "⚡에너지/전력": ["에너지", "전력", "태양광", "배터리", "ESS", "원전", "유가", "석유"],
-    "💊바이오/헬스": ["바이오", "신약", "임상", "의료", "제약", "치료제", "백신"],
-    "🚗자동차/전기차": ["전기차", "자동차", "2차전지", "배터리", "EV"],
-    "📡IT/통신": ["IT", "통신", "5G", "6G", "반도체", "클라우드", "데이터센터"],
-    "🏗️건설/부동산": ["건설", "부동산", "재건축", "인프라", "토목"],
-    "💰금융/핀테크": ["금융", "은행", "핀테크", "코인", "블록체인"],
-    "🌾에너지/화학": ["화학", "소재", "철강", "비철금속", "LPG", "가스관", "강관"],
+THEMES = {
+    "방산":    ["방산","무기","전투기","미사일","K-방산","방위산업"],
+    "로봇/AI": ["로봇","AI","인공지능","자율주행","옵티머스"],
+    "2차전지": ["배터리","2차전지","전기차","양극재","음극재","리튬"],
+    "반도체":  ["반도체","HBM","파운드리","메모리","DRAM"],
+    "바이오":  ["바이오","신약","임상","FDA","항암"],
+    "에너지":  ["원유","가스","LPG","석유","에너지","태양광","원전"],
+    "건설":    ["건설","부동산","아파트","재건축"],
+    "조선":    ["조선","LNG선","해운","컨테이너"],
+    "게임":    ["게임","메타버스","NFT","모바일게임"],
+    "화장품":  ["화장품","K뷰티","코스메틱","뷰티"],
 }
 
-def classify_themes(news_texts: list) -> list:
-    found = []
-    combined = " ".join(news_texts)
-    for theme, kws in THEME_KEYWORDS.items():
-        if any(kw in combined for kw in kws):
-            found.append(theme)
-    return found
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
-# ──────────────────────────────────────────
-# 9. 시간외 특징주 수집
-# ──────────────────────────────────────────
-def fetch_after_market():
-    result = {"상승": [], "하락": []}
+
+def get_gsheet():
+    cred_json = os.environ.get("GOOGLE_CREDENTIALS", "")
+    if not cred_json:
+        return None
     try:
-        url = "https://finance.naver.com/sise/sise_quant.nhn?sosok=1"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "lxml")
-        rows = soup.select("table.type_2 tr")
-        for row in rows[:10]:
-            cols = row.select("td")
-            if len(cols) >= 4:
-                name = cols[1].get_text(strip=True)
-                chg_text = cols[4].get_text(strip=True).replace(",", "").replace("%", "")
-                try:
-                    chg = float(chg_text)
-                    if chg > 0:
-                        result["상승"].append({"종목명": name, "등락률": chg})
-                    elif chg < 0:
-                        result["하락"].append({"종목명": name, "등락률": chg})
-                except:
-                    pass
+        creds = Credentials.from_service_account_info(
+            json.loads(cred_json), scopes=SCOPES
+        )
+        gc = gspread.authorize(creds)
+        return gc.open_by_key(SHEETS_ID)
     except Exception as e:
-        print(f"[시간외 수집 오류] {e}")
-    return result
+        print(f"[Sheets 오류] {e}")
+        return None
 
-# ──────────────────────────────────────────
-# 메인 리포트 생성
-# ──────────────────────────────────────────
+
+def fetch_rss(url, source):
+    items = []
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(r.content, "xml")
+        for item in soup.find_all("item")[:15]:
+            title = item.find("title")
+            link  = item.find("link")
+            if title and link:
+                items.append({
+                    "title":  title.text.strip(),
+                    "url":    link.text.strip(),
+                    "source": source
+                })
+    except Exception as e:
+        print(f"[{source} RSS 오류] {e}")
+    return items
+
+
+def fetch_all_news():
+    news = []
+    sources = [
+        ("https://rss.hankyung.com/economy/stocks.xml",     "한국경제"),
+        ("https://rss.hankyung.com/economy/finance.xml",    "한국경제"),
+        ("https://www.mk.co.kr/rss/40300001/",              "매일경제"),
+        ("https://www.yna.co.kr/rss/economy.xml",           "연합뉴스"),
+    ]
+    for url, src in sources:
+        items = fetch_rss(url, src)
+        news.extend(items)
+        print(f"  [{src}] {len(items)}건")
+    return news
+
+
+def fetch_krx_upper():
+    stocks = []
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        url   = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+        hdrs  = {**HEADERS, "Referer": "https://data.krx.co.kr"}
+        payload = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
+            "locale": "ko_KR", "mktId": "ALL",
+            "trdDd": today, "share": "1", "money": "1", "csvxls_isNo": "false",
+        }
+        r = requests.post(url, data=payload, headers=hdrs, timeout=15)
+        for item in r.json().get("OutBlock_1", []):
+            try:
+                chg = float(str(item.get("FLUC_RT", "0")).replace(",", ""))
+                if chg >= 10:
+                    stocks.append({
+                        "code":        item.get("ISU_SRT_CD", ""),
+                        "name":        item.get("ISU_ABBRV", ""),
+                        "price":       item.get("CLSPRC", ""),
+                        "change_rate": chg,
+                        "volume":      item.get("ACC_TRDVOL", ""),
+                    })
+            except:
+                continue
+        stocks.sort(key=lambda x: x["change_rate"], reverse=True)
+    except Exception as e:
+        print(f"[KRX 오류] {e}")
+    return stocks[:30]
+
+
+def fetch_dart_today():
+    items = []
+    try:
+        api_key = os.environ.get("DART_API_KEY", "")
+        today   = datetime.now().strftime("%Y%m%d")
+        url = (f"https://opendart.fss.or.kr/api/list.json"
+               f"?crtfc_key={api_key}&bgn_de={today}&end_de={today}"
+               f"&page_count=40&sort=rdt&sort_mth=desc")
+        r = requests.get(url, timeout=15)
+        for item in r.json().get("list", []):
+            items.append({
+                "corp":  item.get("corp_name", ""),
+                "title": item.get("report_nm", ""),
+                "date":  item.get("rcept_dt", ""),
+                "url":   f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={item.get('rcept_no','')}",
+            })
+    except Exception as e:
+        print(f"[DART 오류] {e}")
+    return items[:30]
+
+
+def auto_reason(stock_name, news_list):
+    """급등주 이름으로 관련 뉴스 자동 매칭 → 이유 추출"""
+    for news in news_list:
+        if stock_name in news.get("title", ""):
+            title = news["title"]
+            # 핵심 이유 추출 (종목명 뒤 내용)
+            idx = title.find(stock_name)
+            reason = title[idx + len(stock_name):].strip(" ,.-·")
+            if reason:
+                return reason[:40]
+    return "당일 뉴스 매칭 없음"
+
+
+def classify_themes(news_list):
+    theme_counts = {t: 0 for t in THEMES}
+    theme_news   = {t: [] for t in THEMES}
+    for news in news_list:
+        title = news.get("title", "")
+        for theme, keywords in THEMES.items():
+            for kw in keywords:
+                if kw in title:
+                    theme_counts[theme] += 1
+                    if len(theme_news[theme]) < 3:
+                        theme_news[theme].append({
+                            "title":  title,
+                            "url":    news.get("url", ""),
+                            "source": news.get("source", "")
+                        })
+                    break
+    active = {
+        t: {"count": c, "news": theme_news[t]}
+        for t, c in theme_counts.items() if c > 0
+    }
+    return dict(sorted(active.items(), key=lambda x: x[1]["count"], reverse=True))
+
+
 def run_market_report():
-    print("=== 시황 리포트 생성 시작 ===")
-    report = {}
+    print("=== ANDY JO's STOCK AI 시황 리포트 시작 ===")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        f_krx    = ex.submit(fetch_krx_top_movers)
-        f_index  = ex.submit(fetch_index_summary)
-        f_dart   = ex.submit(fetch_dart_today)
-        f_mk     = ex.submit(fetch_mk_market)
-        f_hk     = ex.submit(fetch_hankyung_market)
-        f_yh     = ex.submit(fetch_yonhap_market)
+    print("[1] 뉴스 수집...")
+    news = fetch_all_news()
+    print(f"    총 {len(news)}건")
 
-    krx_data    = f_krx.result()
-    index_data  = f_index.result()
-    dart_data   = f_dart.result()
-    mk_news     = f_mk.result()
-    hk_news     = f_hk.result()
-    yh_news     = f_yh.result()
+    print("[2] KRX 급등·상한가...")
+    upper = fetch_krx_upper()
+    print(f"    {len(upper)}건")
 
-    all_news = mk_news + hk_news + yh_news
-    themes_today = classify_themes(all_news)
+    # 급등주별 이유 자동 매칭
+    for s in upper:
+        s["reason"] = auto_reason(s["name"], news)
 
-    # 급등주별 뉴스 추가 (상위 10개만)
-    top_stocks = krx_data.get("급등주", [])[:10]
-    for stock in top_stocks:
-        news = fetch_naver_news(stock["코드"], stock["종목명"])
-        stock["뉴스"] = news
-        stock["테마"] = classify_themes(news + [stock["종목명"]])
-        time.sleep(0.2)
+    print("[3] DART 공시...")
+    dart = fetch_dart_today()
+    print(f"    {len(dart)}건")
 
-    report["분석일"]       = TODAY_STR
-    report["KOSPI지수"]    = json.dumps(index_data.get("KOSPI", {}), ensure_ascii=False)
-    report["KOSDAQ지수"]   = json.dumps(index_data.get("KOSDAQ", {}), ensure_ascii=False)
-    report["오늘테마"]     = json.dumps(themes_today, ensure_ascii=False)
-    report["상한가"]       = json.dumps(krx_data.get("상한가", []), ensure_ascii=False)
-    report["급등주"]       = json.dumps(top_stocks, ensure_ascii=False)
-    report["호재공시"]     = json.dumps(dart_data.get("호재", [])[:10], ensure_ascii=False)
-    report["악재공시"]     = json.dumps(dart_data.get("악재", [])[:10], ensure_ascii=False)
-    report["시황뉴스"]     = json.dumps(all_news[:10], ensure_ascii=False)
+    print("[4] 테마 분류...")
+    themes = classify_themes(news)
+    print(f"    활성 테마: {list(themes.keys())}")
 
-    after = fetch_after_market()
-    report["시간외상승"]   = json.dumps(after.get("상승", [])[:10], ensure_ascii=False)
-    report["시간외하락"]   = json.dumps(after.get("하락", [])[:10], ensure_ascii=False)
+    report = {
+        "generated_at":       now,
+        "themes":             themes,
+        "upper_limit_stocks": upper,
+        "dart_disclosures":   dart,
+        "news":               news[:25],
+    }
 
-    save_market_report(report)
-    print(f"=== 시황 리포트 완료 | 테마 {len(themes_today)}개 | 급등주 {len(top_stocks)}개 ===")
+    print("[5] Sheets 저장...")
+    try:
+        sh = get_gsheet()
+        if sh:
+            try:
+                ws = sh.worksheet("시황리포트")
+            except:
+                ws = sh.add_worksheet(title="시황리포트", rows=10, cols=2)
+            ws.clear()
+            ws.update("A1", [["generated_at", now]])
+            ws.update("A2", [["report_json", json.dumps(report, ensure_ascii=False)]])
+            print("[5] 저장 완료")
+    except Exception as e:
+        print(f"[5 오류] {e}")
+
+    print("=== 시황 리포트 완료 ===")
     return report
+
 
 if __name__ == "__main__":
     run_market_report()
