@@ -183,20 +183,12 @@ def load_kosdaq_universe() -> pd.DataFrame:
             return pd.DataFrame()
 
         # 컬럼 정규화
-               # 컬럼명 출력 (디버깅용)
-        print(f"[L0] 실제 컬럼목록: {df.columns.tolist()}")
-
-        # 컬럼 자동 매핑
-        col_map = {}
-        for c in df.columns:
-            cl = str(c).strip().lower()
-            if any(x in cl for x in ["시가총액", "marcap", "mktcap", "cap"]):
-                col_map[c] = "mktcap"
-            elif any(x in cl for x in ["종목명", "name"]):
-                col_map[c] = "name"
-            elif any(x in cl for x in ["종목코드", "code", "symbol", "ticker"]):
-                col_map[c] = "code"
-        df = df.rename(columns=col_map)
+                # 실제 컬럼명 기반 직접 매핑
+        df = df.rename(columns={
+            "Code":   "code",
+            "Name":   "name",
+            "Marcap": "mktcap",
+        })
 
 
         required = {"code", "name", "mktcap"}
