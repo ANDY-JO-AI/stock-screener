@@ -1,103 +1,54 @@
-name: ANDY JO Stock AI — Daily Pipeline
+name: Andy Jo Stock AI — 일일 자동 실행
 
 on:
   schedule:
-    - cron: '50 23 * * 0-4'   # KST 08:50 (UTC 23:50 전일)
-    - cron: '30 6  * * 1-5'   # KST 15:30 (UTC 06:30)
-    - cron: '0  10 * * 1-5'   # KST 19:00 (UTC 10:00)
-    - cron: '30 10 * * 1-5'   # KST 19:30 (UTC 10:30)
-  workflow_dispatch:
+    # 한국시간 기준 (UTC+9)
+    - cron: '0 21 * * 1-5'   # 평일 오전 06:00 KST (전일 21:00 UTC)
+    - cron: '30 23 * * 1-5'  # 평일 오전 08:30 KST
+    - cron: '0 2 * * 1-5'    # 평일 오전 11:00 KST
+    - cron: '0 5 * * 1-5'    # 평일 오후 14:00 KST
+    - cron: '0 7 * * 1-5'    # 평일 오후 16:00 KST
+    - cron: '30 8 * * 1-5'   # 평일 오후 17:30 KST (장마감 후)
+  workflow_dispatch:          # 수동 실행 버튼
 
 jobs:
-  morning:
-    if: github.event.schedule == '50 23 * * 0-4'
+  run-pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 55       # 최대 55분 (무료 한도 보호)
+
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with: { python-version: '3.11' }
-      - run: pip install -r requirements.txt
-      - name: 장전 뉴스·테마 수집
+      # 1. 코드 체크아웃
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      # 2. Python 설정
+      - name: Python 3.10 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      # 3. 패키지 설치
+      - name: 패키지 설치
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4. 메인 파이프라인 실행
+      - name: Andy Jo Stock AI 파이프라인 실행
         env:
           DART_API_KEY:       ${{ secrets.DART_API_KEY }}
+          GOOGLE_SHEET_ID:    ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
         run: |
-          python news_engine.py
-          python theme_engine.py
+          python main.py
 
-  close:
-    if: github.event.schedule == '30 6 * * 1-5'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with: { python-version: '3.11' }
-      - run: pip install -r requirements.txt
-      - name: 장마감 시황·급등
-        env:
-          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          KIS_APP_KEY:        ${{ secrets.KIS_APP_KEY }}
-          KIS_APP_SECRET:     ${{ secrets.KIS_APP_SECRET }}
-          KIS_ACCOUNT_NO:     ${{ secrets.KIS_ACCOUNT_NO }}
-        run: python market_report.py
-
-  screening:
-    if: github.event.schedule == '0 10 * * 1-5'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with: { python-version: '3.11' }
-      - run: pip install -r requirements.txt
-      - name: 종목 스크리닝 L0-L6
-        env:
-          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          KIS_APP_KEY:        ${{ secrets.KIS_APP_KEY }}
-          KIS_APP_SECRET:     ${{ secrets.KIS_APP_SECRET }}
-          KIS_ACCOUNT_NO:     ${{ secrets.KIS_ACCOUNT_NO }}
-        run: python filter_engine.py
-
-  after_hours:
-    if: github.event.schedule == '30 10 * * 1-5'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with: { python-version: '3.11' }
-      - run: pip install -r requirements.txt
-      - name: 시간외 특징주 + 텔레그램
-        env:
-          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          KIS_APP_KEY:        ${{ secrets.KIS_APP_KEY }}
-          KIS_APP_SECRET:     ${{ secrets.KIS_APP_SECRET }}
-          KIS_ACCOUNT_NO:     ${{ secrets.KIS_ACCOUNT_NO }}
-          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python after_hours.py
-
-  manual:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with: { python-version: '3.11' }
-      - run: pip install -r requirements.txt
-      - name: 전체 수동 실행
-        env:
-          DART_API_KEY:       ${{ secrets.DART_API_KEY }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          KIS_APP_KEY:        ${{ secrets.KIS_APP_KEY }}
-          KIS_APP_SECRET:     ${{ secrets.KIS_APP_SECRET }}
-          KIS_ACCOUNT_NO:     ${{ secrets.KIS_ACCOUNT_NO }}
-          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python news_engine.py
-          python theme_engine.py
-          python market_report.py
-          python filter_engine.py
-          python after_hours.py
+      # 5. 실행 결과 로그 업로드 (실패해도 항상 저장)
+      - name: 실행 로그 저장
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log-${{ github.run_number }}
+          path: |
+            *.log
+          retention-days: 7
