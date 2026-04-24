@@ -14,7 +14,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 55       # 최대 55분 (무료 한도 보호)
+    timeout-minutes: 90       # 최대 55분 (무료 한도 보호)
 
     steps:
       # 1. 코드 체크아웃
