@@ -1,296 +1,610 @@
 """
-Andy Jo Stock AI — 종목 필터링 엔진 v3
-핵심 개선: pykrx 배치 조회로 전면 재설계 (종목별 개별 호출 완전 제거)
+Andy Jo Stock AI — 필터링 엔진 v3
+시간여행TV 소형주 선정 기준 7레이어 완전 구현
+
+[LAYER 0] 유니버스 정의 (market_engine에서 처리)
+[LAYER 1] 즉시탈락 — HARD REJECT
+[LAYER 2] 재무 점수 — 7점 이상 통과
+[LAYER 3] 수급·거래량
+[LAYER 4] 주주구조
+[LAYER 5] 테마성 평가
+[LAYER 6] 매수 타이밍
 """
 
 import logging
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 
 log = logging.getLogger(__name__)
 
-MKTCAP_MIN = 150
-MKTCAP_MAX = 700
-MIN_TOTAL_SCORE = 2
-TOP_N = 50
+# ────────────────────────────────────────
+# 상수
+# ────────────────────────────────────────
+FIN_SCORE_MIN      = 4   # 재무 점수 최소 (7점 기준 → 데이터 부족 감안 4점으로 완화)
+THEME_SCORE_MIN    = 2   # 테마 점수 최소
+TURNOVER_10D_MAX   = 80  # 현재 10일 평균 거래대금 (억) — 이하면 소외 상태
+PRICE_52W_RATIO    = 1.7 # 52주 최저가 × 1.7 이내 (코스닥 기준)
+TOP_N              = 50  # 트랙별 최대 출력 종목 수
 
-REJECT_KEYWORDS = ["횡령", "배임", "불성실공시", "상장폐지", "관리종목", "워크아웃", "회생절차"]
-REJECT_NAME_PATTERNS = ["스팩", "SPAC", "리츠", "ETF", "ETN"]
-
+# 테마 키워드 → 종목명 매칭
 THEME_KEYWORDS = {
-    "방산": ["방산", "방위", "무기", "미사일"],
-    "원전": ["원전", "원자력", "SMR"],
-    "로봇_AI": ["로봇", "AI로봇", "휴머노이드"],
-    "AI반도체": ["AI반도체", "HBM", "NPU", "파운드리"],
-    "2차전지": ["배터리", "2차전지", "양극재", "음극재"],
-    "바이오": ["바이오", "신약", "ADC", "임상"],
-    "조선": ["조선", "LNG선", "수주"],
-    "우주항공": ["우주", "위성", "발사체"],
-    "수소": ["수소", "연료전지"],
-    "가상화폐": ["비트코인", "코인", "블록체인"],
-    "게임": ["게임", "메타버스"],
-    "엔터": ["K팝", "아이돌", "엔터"],
-    "반도체장비": ["반도체장비", "식각", "증착"],
-    "자동차": ["전기차", "자율주행", "전장"],
-    "철강": ["철강", "제철"],
+    "방산":     ["방산", "방위", "무기", "미사일", "탄약", "군수"],
+    "원전":     ["원전", "원자력", "SMR", "핵융합", "방사선"],
+    "로봇_AI":  ["로봇", "자동화", "AI", "인공지능", "드론"],
+    "2차전지":  ["배터리", "전지", "양극재", "음극재", "리튬"],
+    "바이오":   ["바이오", "제약", "의약", "신약", "헬스"],
+    "조선":     ["조선", "선박", "해양", "LNG"],
+    "우주항공": ["우주", "항공", "위성", "발사체"],
+    "수소":     ["수소", "연료전지", "그린"],
+    "반도체":   ["반도체", "웨이퍼", "칩", "파운드리"],
+    "건설":     ["건설", "건축", "토목", "플랜트"],
+    "게임":     ["게임", "엔터", "콘텐츠", "미디어"],
+    "정치":     ["테마", "정치", "대선", "총선"],
+    "미세먼지": ["마스크", "공기청정", "필터", "환경"],
+    "조류독감": ["조류", "독감", "백신", "수산"],
+    "철강":     ["철강", "제철", "금속", "스틸"],
 }
 
-# ────────────────────────────────────────
-# 1. pykrx 배치 데이터 로드 (핵심 개선)
-# ────────────────────────────────────────
-def load_market_data_batch():
+
+# ════════════════════════════════════════
+# LAYER 1 — 즉시탈락 필터 (HARD REJECT)
+# ════════════════════════════════════════
+def check_l1_hard_reject(row, disclosure_risk, financial_data, week52_data):
     """
-    pykrx로 KOSDAQ 전종목 데이터를 단 1회 배치 조회
-    반환: {종목코드: {price, volume, change, marcap, ...}}
+    시간여행TV 즉시탈락 9개 조건 체크
+    반환: (탈락여부, 탈락사유)
     """
-    try:
-        from pykrx import stock as krx
-        today = datetime.now().strftime("%Y%m%d")
-        # 영업일 기준 전날 (주말/공휴일 대비 3일 전)
-        prev = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d")
+    code  = str(row.get("Code", ""))
+    name  = str(row.get("Name", ""))
+    price = float(row.get("Close", 0) or 0)
 
-        log.info("pykrx 배치 데이터 조회 시작 (전종목 1회)")
+    # ① 공시 위험 (횡령·상장폐지·거래정지 등)
+    if disclosure_risk.get("hard_reject", False):
+        return True, disclosure_risk.get("reject_reason", "공시위험")
 
-        # 오늘 전종목 시세 (1회 호출)
-        df_today = krx.get_market_ohlcv_by_ticker(today, market="KOSDAQ")
-        # 시가총액 (1회 호출)
-        df_cap = krx.get_market_cap_by_ticker(today, market="KOSDAQ")
+    # ② CB/BW/유상증자 (최근 14일 배치에서 확인)
+    #    → 2년치는 별도 확인이 필요하나 배치에서 감지된 것만 우선 적용
+    if disclosure_risk.get("has_cb_bw", False):
+        return True, f"CB/BW감지: {disclosure_risk.get('cb_bw_detail','')}"
 
-        if df_today.empty or df_cap.empty:
-            # 전일 데이터로 재시도
-            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-            df_today = krx.get_market_ohlcv_by_ticker(yesterday, market="KOSDAQ")
-            df_cap = krx.get_market_cap_by_ticker(yesterday, market="KOSDAQ")
+    # ③ 자금대여 의심
+    if disclosure_risk.get("has_money_leak", False):
+        return True, "자금대여 의심 공시"
 
-        # 병합
-        df = df_today.join(df_cap[["시가총액", "상장주식수"]], how="left")
-        df["Marcap_억"] = df["시가총액"] / 1e8
-        df["Code"] = df.index
+    # ④ 3년 연속 적자
+    fin = financial_data or {}
+    if not fin.get("op_profit_ok", True):
+        profits = fin.get("op_profit_3y", [])
+        valid   = [p for p in profits if p is not None]
+        if len(valid) >= 2 and all(p < 0 for p in valid):
+            return True, f"연속적자: {[round(p/1e8,1) if p else None for p in profits]}"
 
-        # 컬럼 정규화
-        col_map = {
-            "시가": "Open", "고가": "High", "저가": "Low",
-            "종가": "Close", "거래량": "Volume", "등락률": "ChangeRatio"
-        }
-        df = df.rename(columns=col_map)
+    # ⑤ 자본잠식 50% 이상
+    erosion = fin.get("capital_erosion", 0) or 0
+    if erosion >= 50:
+        return True, f"자본잠식 {erosion:.0f}%"
 
-        # 종목명 추가
-        try:
-            name_df = krx.get_market_ticker_name_by_ticker(today, market="KOSDAQ")
-            # pykrx API 버전에 따라 다름
-        except Exception:
-            pass
+    # ⑥ 부채비율 100% 이상
+    debt_ratio = fin.get("debt_ratio")
+    if debt_ratio is not None and debt_ratio >= 100:
+        return True, f"부채비율 {debt_ratio:.0f}%"
 
-        log.info(f"pykrx 배치 조회 완료: {len(df)}종목")
-        return df
+    # ⑦ 주가 위치 — 52주 최저가 × 1.7 초과 (이미 많이 오른 종목)
+    w52 = week52_data.get(code, {})
+    low52 = w52.get("low52", 0)
+    if low52 > 0 and price > 0:
+        ratio = price / low52
+        if ratio > PRICE_52W_RATIO:
+            return True, f"주가위치 과도: 52주최저대비 {ratio:.1f}배"
 
-    except Exception as e:
-        log.error(f"pykrx 배치 조회 실패: {e}")
-        return pd.DataFrame()
+    # ⑧ 당일 급락 -15% 이하
+    change = float(row.get("ChangeRatio", 0) or 0)
+    if change <= -15:
+        return True, f"당일급락: {change:.1f}%"
 
-# ────────────────────────────────────────
-# 2. FinanceDataReader 유니버스 로드
-# ────────────────────────────────────────
-def load_kosdaq_universe():
-    try:
-        import FinanceDataReader as fdr
-        df = fdr.StockListing("KOSDAQ")
-        df = df.dropna(subset=["Marcap"])
-        df["Marcap_억"] = df["Marcap"] / 1e8
-        df["Code"] = df["Code"].astype(str).str.zfill(6)
-        filtered = df[
-            (df["Marcap_억"] >= MKTCAP_MIN) &
-            (df["Marcap_억"] <= MKTCAP_MAX)
-        ].copy()
-        log.info(f"L0 유니버스: KOSDAQ {len(df)}종목 → 시가총액 필터 후 {len(filtered)}종목")
-        return filtered
-    except Exception as e:
-        log.error(f"유니버스 로드 실패: {e}")
-        return pd.DataFrame()
+    # ⑨ IR 남발 (4건 이상)
+    puff = disclosure_risk.get("ir_puff_count", 0)
+    if puff >= 4:
+        return True, f"IR남발 {puff}건"
 
-# ────────────────────────────────────────
-# 3. 뉴스 기반 종목 언급 맵 사전 생성 (핵심 개선)
-#    → 종목별 반복 검색 대신 1회 전처리
-# ────────────────────────────────────────
-def build_news_mention_map(news_data, universe_df):
+    return False, ""
+
+
+# ════════════════════════════════════════
+# LAYER 2 — 재무 점수
+# ════════════════════════════════════════
+def calc_l2_financial_score(row, financial_data):
     """
-    {종목코드: 언급횟수} 딕셔너리 1회 생성
+    시간여행TV 재무 점수 계산
+    반환: (점수, 상세내용, 통과여부)
     """
-    mention_map = {}
-    all_titles = " ".join([a.get("title", "") for a in news_data[:500]])
+    fin     = financial_data or {}
+    score   = fin.get("fin_score", 3)
+    detail  = fin.get("fin_score_detail", "기본점수")
 
-    for _, row in universe_df.iterrows():
-        name = str(row.get("Name", ""))
-        code = str(row.get("Code", ""))
-        count = all_titles.count(name) if len(name) >= 3 else 0
-        if count > 0:
-            mention_map[code] = count
+    # 매출/시총 비율 추가 점수 (filter_engine에서 계산)
+    marcap  = float(row.get("Marcap_억", 0) or 0) * 1e8
+    revenue = fin.get("revenue")
+    if revenue and marcap and marcap > 0:
+        ratio = revenue / marcap
+        if ratio >= 1.0:
+            score  += 2
+            detail += f" / 매출/시총={ratio:.1f}(+2)"
+        elif ratio >= 0.5:
+            score  += 1
+            detail += f" / 매출/시총={ratio:.1f}(+1)"
 
-    log.info(f"뉴스 언급 종목: {len(mention_map)}개")
-    return mention_map
+    # 순자산 > 시총 추가 점수
+    equity = fin.get("equity")
+    if equity and marcap and equity > marcap:
+        score  += 2
+        detail += " / 순자산>시총(+2)"
 
-# ────────────────────────────────────────
-# 4. 테마 매칭 맵 사전 생성
-# ────────────────────────────────────────
-def build_theme_match_map(universe_df):
+    passed = score >= FIN_SCORE_MIN
+    return score, detail, passed
+
+
+# ════════════════════════════════════════
+# LAYER 3 — 수급·거래량
+# ════════════════════════════════════════
+def check_l3_volume(row, volume_history):
     """
-    {종목코드: [매칭 테마, ...]} 딕셔너리 1회 생성
+    반환: (통과여부, 상태설명, 플래그dict)
     """
-    theme_map = {}
-    for _, row in universe_df.iterrows():
-        name = str(row.get("Name", ""))
-        code = str(row.get("Code", ""))
-        matched = []
-        for theme, kws in THEME_KEYWORDS.items():
-            for kw in kws:
-                if kw in name:
-                    matched.append(theme)
-                    break
-        if matched:
-            theme_map[code] = matched
-    return theme_map
+    code      = str(row.get("Code", ""))
+    turnover  = float(row.get("Turnover_억", 0) or 0)
+    flags     = {}
 
-# ────────────────────────────────────────
-# 5. 단일 종목 분석 (메모리 처리 — API 호출 없음)
-# ────────────────────────────────────────
-def analyze_stock(row, dart_signals, theme_scores, mention_map, theme_map, news_data):
-    code = str(row.get("Code", "")).zfill(6)
-    name = str(row.get("Name", ""))
+    # ① 과거 3년 내 거래대금 100억 돌파 이력
+    hist = volume_history.get(code, {})
+    has_100억 = hist.get("has_100억", True)  # 캐시 없으면 통과 처리
+    max_t     = hist.get("max_turnover_억", 0)
 
-    result = {
-        "code": code, "name": name,
-        "mktcap": round(float(row.get("Marcap_억", 0) or 0), 1),
-        "price": float(row.get("Close", 0) or 0),
-        "change": float(row.get("ChangeRatio", 0) or 0),
-        "volume": float(row.get("Volume", 0) or 0),
-        "track": None, "total_score": 0,
-        "l2_score": 0, "l4_score": 5, "l5_score": 0,
-        "themes": [], "reject_reason": ""
+    if not has_100억 and max_t > 0:
+        return False, f"거래대금이력없음(최대{max_t:.0f}억)", flags
+
+    flags["has_volume_history"] = has_100억
+    flags["max_turnover_억"]    = max_t
+
+    # ② 현재 소외 상태 확인 (매수 적기)
+    flags["current_turnover_억"] = round(turnover, 1)
+    flags["is_neglected"]        = turnover <= TURNOVER_10D_MAX
+
+    if not flags["is_neglected"]:
+        flags["volume_warn"] = f"현재거래대금 {turnover:.0f}억 (소외아님)"
+
+    return True, "수급OK", flags
+
+
+# ════════════════════════════════════════
+# LAYER 4 — 주주구조
+# ════════════════════════════════════════
+def calc_l4_shareholder(dart_shareholder_info):
+    """
+    반환: (점수, 상태설명, 플래그dict)
+    """
+    score = 0
+    flags = {}
+    detail_parts = []
+
+    if not dart_shareholder_info:
+        return 3, "주주정보없음(기본)", {"note": "데이터없음"}
+
+    share_pct   = dart_shareholder_info.get("major_share_pct", None)
+    tenure_year = dart_shareholder_info.get("ceo_tenure_year", None)
+
+    # 최대주주 지분율
+    if share_pct is not None:
+        flags["major_share_pct"] = share_pct
+        if share_pct < 30:
+            score += 2
+            detail_parts.append(f"지분{share_pct:.1f}%<30%(+2, 경영권압박)")
+        elif share_pct > 70:
+            score += 2
+            detail_parts.append(f"지분{share_pct:.1f}%>70%(+2, 유통희박)")
+        elif 30 <= share_pct <= 50:
+            score += 0
+            detail_parts.append(f"지분{share_pct:.1f}%(보통)")
+            flags["share_warn"] = "매도 가능성 주의"
+
+    # CEO 재임기간
+    if tenure_year is not None:
+        flags["ceo_tenure_year"] = tenure_year
+        if tenure_year >= 10:
+            score += 2
+            detail_parts.append(f"재임{tenure_year}년(+2)")
+        elif tenure_year >= 5:
+            score += 1
+            detail_parts.append(f"재임{tenure_year}년(+1)")
+
+    detail = " / ".join(detail_parts) if detail_parts else "주주정보기본"
+    return score, detail, flags
+
+
+# ════════════════════════════════════════
+# LAYER 5 — 테마성 평가
+# ════════════════════════════════════════
+def calc_l5_theme(row, news_data, theme_scores):
+    """
+    반환: (점수, 매칭테마list, 상태설명)
+    """
+    name  = str(row.get("Name", ""))
+    score = 0
+    matched_themes = []
+    detail_parts   = []
+
+    # 종목명 기반 테마 매칭
+    for theme, keywords in THEME_KEYWORDS.items():
+        for kw in keywords:
+            if kw in name:
+                matched_themes.append(theme)
+                # 해당 테마 온도 점수 반영
+                t_data  = theme_scores.get(theme, {})
+                t_score = t_data.get("score", 0) if isinstance(t_data, dict) else 0
+                score  += t_score * 0.6
+                detail_parts.append(f"{theme}테마(온도{t_score:.1f})")
+                break
+
+    # 뉴스 언급 보너스
+    mention = sum(
+        1 for a in news_data[:500]
+        if name in a.get("title", "") and len(name) >= 3
+    )
+    if mention >= 5:
+        score += 3
+        detail_parts.append(f"뉴스{mention}건(+3)")
+    elif mention >= 3:
+        score += 2
+        detail_parts.append(f"뉴스{mention}건(+2)")
+    elif mention >= 1:
+        score += 1
+        detail_parts.append(f"뉴스{mention}건(+1)")
+
+    # 과거 상한가 이력 보너스 (theme_scores에 포함된 경우)
+    for theme in matched_themes:
+        t_data = theme_scores.get(theme, {})
+        if isinstance(t_data, dict) and t_data.get("has_upper_limit"):
+            score += 2
+            detail_parts.append(f"{theme} 상한가이력(+2)")
+            break
+
+    detail = " / ".join(detail_parts) if detail_parts else "테마미해당"
+    return round(score, 2), matched_themes, detail
+
+
+# ════════════════════════════════════════
+# LAYER 6 — 매수 타이밍
+# ════════════════════════════════════════
+def check_l6_timing(row, week52_data):
+    """
+    반환: (통과여부, 상태설명, 플래그dict)
+    """
+    code   = str(row.get("Code", ""))
+    price  = float(row.get("Close", 0) or 0)
+    change = float(row.get("ChangeRatio", 0) or 0)
+    flags  = {}
+
+    w52   = week52_data.get(code, {})
+    low52 = w52.get("low52", 0)
+
+    # 52주 최저가 대비 위치
+    if low52 > 0 and price > 0:
+        ratio = price / low52
+        flags["price_52w_ratio"] = round(ratio, 2)
+        flags["low52"]           = low52
+
+        if ratio <= 1.5:
+            flags["timing_grade"] = "최적"
+        elif ratio <= PRICE_52W_RATIO:
+            flags["timing_grade"] = "양호"
+        else:
+            # L1에서 이미 걸러졌어야 하지만 안전망
+            return False, f"52주최저대비{ratio:.1f}배(과도)", flags
+    else:
+        flags["timing_grade"] = "확인불가"
+
+    # 소외 상태 재확인
+    turnover = float(row.get("Turnover_억", 0) or 0)
+    flags["is_neglected"] = turnover <= TURNOVER_10D_MAX
+
+    # 당일 급등 여부 (LAUNCHED 후보)
+    flags["change"] = change
+
+    detail = f"52주위치{flags.get('timing_grade','?')} / {'소외' if flags['is_neglected'] else '관심집중'}"
+    return True, detail, flags
+
+
+# ════════════════════════════════════════
+# 결과 카드 생성 — 이용자에게 보여줄 텍스트
+# ════════════════════════════════════════
+def build_result_card(
+    row, track,
+    l1_reason, fin_score, fin_detail,
+    l3_flags, l4_score, l4_detail, l4_flags,
+    theme_score, themes, theme_detail,
+    l6_flags, disclosure_risk, financial_data
+):
+    """
+    이용자가 한눈에 파악할 수 있는 결과 카드 생성
+    """
+    name   = str(row.get("Name", ""))
+    code   = str(row.get("Code", ""))
+    price  = float(row.get("Close", 0) or 0)
+    change = float(row.get("ChangeRatio", 0) or 0)
+    marcap = float(row.get("Marcap_억", 0) or 0)
+    volume = float(row.get("Volume", 0) or 0)
+
+    # 즉시탈락 체크리스트
+    checks = []
+    fin = financial_data or {}
+
+    op_ok   = fin.get("op_profit_ok", True)
+    debt_ok = fin.get("debt_ratio_ok", True)
+    eros_ok = fin.get("erosion_ok", True)
+    cb_ok   = not disclosure_risk.get("has_cb_bw", False)
+    dr_ok   = not disclosure_risk.get("hard_reject", False)
+    w52_ok  = l6_flags.get("price_52w_ratio", 1.0) <= PRICE_52W_RATIO
+    vol_ok  = l3_flags.get("has_volume_history", True)
+
+    checks.append(f"{'✅' if op_ok else '❌'} 연속적자없음")
+    checks.append(
+        f"{'✅' if debt_ok else '❌'} "
+        f"부채비율 {fin.get('debt_ratio','N/A')}%"
+    )
+    checks.append(
+        f"{'✅' if eros_ok else '❌'} "
+        f"자본잠식률 {fin.get('capital_erosion', 0):.0f}%"
+    )
+    checks.append(f"{'✅' if cb_ok else '⚠️'} CB/BW 없음")
+    checks.append(f"{'✅' if dr_ok else '❌'} 공시위험없음")
+    checks.append(
+        f"{'✅' if w52_ok else '⚠️'} "
+        f"52주최저대비 {l6_flags.get('price_52w_ratio', '?')}배"
+    )
+    checks.append(
+        f"{'✅' if vol_ok else '⚠️'} "
+        f"거래대금이력(최대{l3_flags.get('max_turnover_억',0):.0f}억)"
+    )
+
+    # 주의사항
+    warns = disclosure_risk.get("warn_flags", [])
+    if not l3_flags.get("is_neglected", True):
+        warns.append(
+            f"현재거래대금 {l3_flags.get('current_turnover_억',0):.0f}억"
+            f" (소외아님 — 매수주의)"
+        )
+    if l4_flags.get("share_warn"):
+        warns.append(l4_flags["share_warn"])
+
+    # 직접확인 필요 항목
+    manual_checks = [
+        "□ 자회사 금전대여 여부 (DART 공시 직접 확인)",
+        "□ 장대양봉→장대음봉 패턴 없음 확인",
+    ]
+    if not l4_flags.get("major_share_pct"):
+        manual_checks.append("□ 최대주주 지분율 확인")
+
+    naver_url = f"https://finance.naver.com/item/main.naver?code={code}"
+    dart_url  = f"https://dart.fss.or.kr/dsab007/main.do?autoSearch=true&textCrpNm={name}"
+
+    return {
+        "code":          code,
+        "name":          name,
+        "track":         track,
+        "price":         price,
+        "change":        change,
+        "marcap_억":     round(marcap, 1),
+        "volume":        int(volume),
+        "themes":        themes,
+        "fin_score":     fin_score,
+        "fin_detail":    fin_detail,
+        "theme_score":   theme_score,
+        "theme_detail":  theme_detail,
+        "l4_score":      l4_score,
+        "l4_detail":     l4_detail,
+        "total_score":   round(
+            fin_score * 0.4 + theme_score * 0.4 + l4_score * 0.2, 2
+        ),
+        "checks":        checks,
+        "warns":         warns,
+        "manual_checks": manual_checks,
+        "naver_url":     naver_url,
+        "dart_url":      dart_url,
+        "timing_grade":  l6_flags.get("timing_grade", "확인불가"),
+        "is_neglected":  l6_flags.get("is_neglected", False),
+        "price_52w_ratio": l6_flags.get("price_52w_ratio", None),
+        "reject_reason": l1_reason,
+        "debt_ratio":    fin.get("debt_ratio"),
+        "reserve_ratio": fin.get("reserve_ratio"),
+        "roe":           fin.get("roe"),
+        "op_profit_3y":  fin.get("op_profit_3y", []),
     }
 
-    # L1: 즉시 탈락
-    for pat in REJECT_NAME_PATTERNS:
-        if pat in name:
-            result["reject_reason"] = f"패턴탈락:{pat}"
-            return result
 
-    # 뉴스 키워드 탈락 (사전 빌드된 mention_map 활용)
-    mention_count = mention_map.get(code, 0)
+# ════════════════════════════════════════
+# L0-L1 필터 (main.py STEP 4에서 호출)
+# ════════════════════════════════════════
+def apply_l0_l1_filter(universe_df, disclosure_map):
+    """
+    공시 기반 즉시탈락만 우선 적용
+    재무·52주 데이터는 아직 없으므로 공시 위험만 제거
+    반환: 통과 DataFrame
+    """
+    from dart_engine import analyze_disclosure_risk
+    from market_engine import load_corp_code_map
 
-    # L2: 재무점수 (배치 데이터 기반 — API 호출 없음)
-    l2_score = 3  # 기본점수
-    change = result["change"]
-    volume = result["volume"]
-    marcap = result["mktcap"]
+    corp_map = load_corp_code_map()
+    pass_rows = []
 
-    if change > 5:
-        l2_score += 3
-    elif change > 2:
-        l2_score += 2
-    elif change > 0:
-        l2_score += 1
-    elif change < -10:
-        result["reject_reason"] = f"급락탈락({change:.1f}%)"
-        return result
+    for _, row in universe_df.iterrows():
+        code      = str(row.get("Code", ""))
+        corp_code = corp_map.get(code, "")
 
-    if volume > 1000000:
-        l2_score += 2
-    elif volume > 300000:
-        l2_score += 1
+        disc_risk = analyze_disclosure_risk(corp_code, disclosure_map) \
+            if corp_code else {}
 
-    result["l2_score"] = l2_score
+        if disc_risk.get("hard_reject", False):
+            continue  # 탈락
 
-    # L3: 유동성 (배치 데이터 기반)
-    price = result["price"]
-    if price > 0:
-        turnover = volume * price / 1e8
-        if turnover < 1:
-            result["reject_reason"] = f"유동성부족({turnover:.1f}억)"
-            return result
+        pass_rows.append(row)
 
-    # L4: DART
-    if dart_signals and code in dart_signals:
-        dart = dart_signals[code]
-        if not dart.get("pass", True):
-            result["reject_reason"] = dart.get("reason", "DART탈락")
-            return result
-        result["l4_score"] = dart.get("score", 5)
-
-    # L5: 테마 점수
-    themes = theme_map.get(code, [])
-    l5_score = mention_count * 1.5  # 뉴스 언급 보너스
-
-    for theme in themes:
-        theme_data = theme_scores.get(theme, {})
-        if isinstance(theme_data, dict):
-            t_score = theme_data.get("score", 0)
-        else:
-            t_score = float(theme_data) if theme_data else 0
-        l5_score += t_score * 0.8
-
-    result["l5_score"] = round(min(l5_score, 10), 2)
-    result["themes"] = themes
-
-    # 총점
-    total = (result["l2_score"] * 0.3) + (result["l4_score"] * 0.3) + (result["l5_score"] * 0.4)
-    result["total_score"] = round(total, 2)
-
-    if result["total_score"] < MIN_TOTAL_SCORE:
-        result["reject_reason"] = f"점수미달({result['total_score']:.1f})"
-        return result
-
-    # 트랙 분류
-    if change >= 20:
-        result["track"] = "LAUNCHED"
-    elif result["total_score"] >= 4 and themes:
-        result["track"] = "BUY_NOW"
-    else:
-        result["track"] = "READY"
-
+    result = pd.DataFrame(pass_rows).reset_index(drop=True)
+    log.info(f"L0-L1 필터 완료: {len(universe_df)} → {len(result)}종목")
     return result
 
-# ────────────────────────────────────────
-# 6. 메인 파이프라인
-# ────────────────────────────────────────
-def run_pipeline(news_data, dart_signals, theme_scores):
-    # 유니버스 로드
-    universe = load_kosdaq_universe()
-    if universe.empty:
-        log.error("유니버스 로드 실패")
-        return {"READY": [], "BUY_NOW": [], "LAUNCHED": []}
 
-    total = len(universe)
+# ════════════════════════════════════════
+# L2-L6 전체 필터 (main.py STEP 6에서 호출)
+# ════════════════════════════════════════
+def apply_l2_l6_filter(
+    candidates_df, financial_map,
+    disclosure_map, news_data,
+    theme_scores=None, shareholder_map=None,
+    volume_history=None, week52_data=None
+):
+    """
+    전체 필터 적용 및 트랙 분류
+    반환: {"READY": [], "BUY_NOW": [], "CORE": [], "LAUNCHED": [], "REJECTED": []}
+    """
+    from dart_engine import analyze_disclosure_risk
+    from market_engine import load_corp_code_map
 
-    # 사전 맵 1회 생성 (핵심: 이후 종목별 루프에서 API 호출 없음)
-    log.info("뉴스 언급 맵 및 테마 맵 사전 생성 중...")
-    mention_map = build_news_mention_map(news_data, universe)
-    theme_map = build_theme_match_map(universe)
+    if theme_scores is None:
+        theme_scores = {}
+    if shareholder_map is None:
+        shareholder_map = {}
+    if volume_history is None:
+        volume_history = {}
+    if week52_data is None:
+        week52_data = {}
 
-    log.info(f"필터링 시작: {total}종목 대상")
+    corp_map = load_corp_code_map()
 
-    ready, buy_now, launched = [], [], []
+    ready, buy_now, core, launched, rejected = [], [], [], [], []
+    total = len(candidates_df)
 
-    for i, (_, row) in enumerate(universe.iterrows()):
-        result = analyze_stock(row, dart_signals, theme_scores, mention_map, theme_map, news_data)
+    log.info(f"L2-L6 필터링 시작: {total}종목")
 
-        if result["track"] == "READY":
-            ready.append(result)
-        elif result["track"] == "BUY_NOW":
-            buy_now.append(result)
-        elif result["track"] == "LAUNCHED":
-            launched.append(result)
+    for i, (_, row) in enumerate(candidates_df.iterrows()):
+        code      = str(row.get("Code", ""))
+        corp_code = corp_map.get(code, "")
+        fin_data  = financial_map.get(code, {})
+        disc_risk = analyze_disclosure_risk(corp_code, disclosure_map) \
+            if corp_code else {}
+        shareholder = shareholder_map.get(code, {})
+
+        # ── L1 재확인 (재무 데이터 포함) ──
+        l1_reject, l1_reason = check_l1_hard_reject(
+            row, disc_risk, fin_data, week52_data
+        )
+        if l1_reject:
+            rejected.append({
+                "code": code,
+                "name": str(row.get("Name", "")),
+                "reject_reason": l1_reason,
+                "track": "REJECTED"
+            })
+            continue
+
+        # ── L2 재무 점수 ──
+        fin_score, fin_detail, fin_pass = calc_l2_financial_score(row, fin_data)
+        if not fin_pass:
+            rejected.append({
+                "code": code,
+                "name": str(row.get("Name", "")),
+                "reject_reason": f"재무점수미달({fin_score}점)",
+                "track": "REJECTED"
+            })
+            continue
+
+        # ── L3 수급 ──
+        l3_pass, l3_detail, l3_flags = check_l3_volume(row, volume_history)
+        if not l3_pass:
+            rejected.append({
+                "code": code,
+                "name": str(row.get("Name", "")),
+                "reject_reason": l3_detail,
+                "track": "REJECTED"
+            })
+            continue
+
+        # ── L4 주주구조 ──
+        l4_score, l4_detail, l4_flags = calc_l4_shareholder(shareholder)
+
+        # ── L5 테마성 ──
+        theme_score, themes, theme_detail = calc_l5_theme(
+            row, news_data, theme_scores
+        )
+
+        # ── L6 타이밍 ──
+        l6_pass, l6_detail, l6_flags = check_l6_timing(row, week52_data)
+        if not l6_pass:
+            rejected.append({
+                "code": code,
+                "name": str(row.get("Name", "")),
+                "reject_reason": l6_detail,
+                "track": "REJECTED"
+            })
+            continue
+
+        # ── 결과 카드 생성 ──
+        card = build_result_card(
+            row, None,
+            "", fin_score, fin_detail,
+            l3_flags, l4_score, l4_detail, l4_flags,
+            theme_score, themes, theme_detail,
+            l6_flags, disc_risk, fin_data
+        )
+
+        # ── 트랙 분류 ──
+        change = float(row.get("ChangeRatio", 0) or 0)
+
+        if change >= 15:
+            card["track"] = "LAUNCHED"
+            launched.append(card)
+        elif (
+            card["total_score"] >= 6
+            and theme_score >= THEME_SCORE_MIN
+            and themes
+            and l3_flags.get("is_neglected", False)
+        ):
+            card["track"] = "CORE"
+            core.append(card)
+        elif (
+            card["total_score"] >= 4
+            and themes
+        ):
+            card["track"] = "BUY_NOW"
+            buy_now.append(card)
+        else:
+            card["track"] = "READY"
+            ready.append(card)
 
         if (i + 1) % 30 == 0:
-            log.info(f"  진행: {i+1}/{total} | READY {len(ready)} / BUY_NOW {len(buy_now)} / LAUNCHED {len(launched)}")
+            log.info(
+                f"  진행: {i+1}/{total} | "
+                f"CORE {len(core)} / BUY_NOW {len(buy_now)} / "
+                f"READY {len(ready)} / 탈락 {len(rejected)}"
+            )
 
-    # 정렬
-    ready.sort(key=lambda x: -x["total_score"])
-    buy_now.sort(key=lambda x: -x["total_score"])
-    launched.sort(key=lambda x: -x["total_score"])
+    # 점수 정렬
+    for lst in [core, buy_now, ready, launched]:
+        lst.sort(key=lambda x: -x["total_score"])
 
-    ready = ready[:TOP_N]
-    buy_now = buy_now[:TOP_N]
-    launched = launched[:TOP_N]
+    result = {
+        "CORE":     core[:TOP_N],
+        "BUY_NOW":  buy_now[:TOP_N],
+        "READY":    ready[:TOP_N],
+        "LAUNCHED": launched[:TOP_N],
+        "REJECTED": rejected[:100],
+    }
 
-    log.info(f"필터링 완료 | READY {len(ready)} / BUY_NOW {len(buy_now)} / LAUNCHED {len(launched)}")
-    return {"READY": ready, "BUY_NOW": buy_now, "LAUNCHED": launched}
+    log.info(
+        f"필터링 완료 | "
+        f"CORE {len(result['CORE'])} / "
+        f"BUY_NOW {len(result['BUY_NOW'])} / "
+        f"READY {len(result['READY'])} / "
+        f"LAUNCHED {len(result['LAUNCHED'])} / "
+        f"탈락 {len(result['REJECTED'])}"
+    )
+    return result
