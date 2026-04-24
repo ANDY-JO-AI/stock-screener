@@ -1,411 +1,373 @@
 """
-Andy Jo Stock AI — Streamlit 대시보드
-5탭 구성: 오늘의 테마 / BUY NOW / READY / LAUNCHED / 팔로우업
+app.py — Andy Jo 주식 AI 대시보드 v3
+시간여행TV 기준 종목선정 결과 시각화
+Streamlit 기반
 """
 
 import streamlit as st
+import gspread
 import pandas as pd
+import json
+import os
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 
-# ────────────────────────────────────────
-# 페이지 기본 설정
-# ────────────────────────────────────────
+# ────────────────────────────────────────────
+# 페이지 설정
+# ────────────────────────────────────────────
 st.set_page_config(
-    page_title="Andy Jo Stock AI",
+    page_title="Andy Jo 주식 AI",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
-# ────────────────────────────────────────
-# 스타일 (다크 테마 강화)
-# ────────────────────────────────────────
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2rem;
-        font-weight: 800;
-        color: #00D4AA;
-        margin-bottom: 0.2rem;
-    }
-    .sub-header {
-        font-size: 0.9rem;
-        color: #888888;
-        margin-bottom: 1.5rem;
-    }
-    .metric-card {
-        background: #1E1E2E;
-        border-radius: 12px;
-        padding: 1rem 1.5rem;
-        border-left: 4px solid;
-        margin-bottom: 0.5rem;
-    }
-    .card-ready    { border-color: #FFD700; }
-    .card-buynow   { border-color: #00FF88; }
-    .card-launched { border-color: #FF6B6B; }
-    .track-badge-READY    { background:#FFD700; color:#000; padding:2px 8px; border-radius:4px; font-size:0.75rem; font-weight:700; }
-    .track-badge-BUY_NOW  { background:#00FF88; color:#000; padding:2px 8px; border-radius:4px; font-size:0.75rem; font-weight:700; }
-    .track-badge-LAUNCHED { background:#FF6B6B; color:#fff; padding:2px 8px; border-radius:4px; font-size:0.75rem; font-weight:700; }
-    .theme-bar {
-        background: #2A2A3E;
-        border-radius: 8px;
-        padding: 0.7rem 1rem;
-        margin-bottom: 0.4rem;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .score-fill {
-        height: 8px;
-        border-radius: 4px;
-        background: linear-gradient(90deg, #00D4AA, #00FF88);
-    }
-    .stTabs [data-baseweb="tab"] {
-        font-size: 1rem;
-        font-weight: 600;
-    }
-</style>
-""", unsafe_allow_html=True)
+SPREADSHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# ────────────────────────────────────────────
+# 트랙 색상 / 아이콘
+# ────────────────────────────────────────────
+TRACK_STYLE = {
+    "CORE":     {"icon": "🔴", "label": "CORE",     "color": "#ff4b4b"},
+    "BUY_NOW":  {"icon": "🟠", "label": "BUY NOW",  "color": "#ffa500"},
+    "READY":    {"icon": "🟡", "label": "READY",    "color": "#ffd700"},
+    "LAUNCHED": {"icon": "🚀", "label": "LAUNCHED", "color": "#888888"},
+}
+
+GRADE_COLOR = {
+    "🔥🔥 과열":        "#ff4b4b",
+    "🔥 활성 (최적진입)": "#ffa500",
+    "📈 형성중":        "#ffd700",
+    "👀 워밍업":        "#4fc3f7",
+    "💤 미활성":        "#888888",
+}
 
 
-# ────────────────────────────────────────
-# 데이터 로드 (캐시 10분)
-# ────────────────────────────────────────
-@st.cache_data(ttl=600)
-def load_data():
+# ────────────────────────────────────────────
+# Google Sheets 연결
+# ────────────────────────────────────────────
+@st.cache_resource(ttl=300)
+def get_spreadsheet():
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+    if not creds_json:
+        return None
+    creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
+    client = gspread.authorize(creds)
+    return client.open_by_key(SPREADSHEET_ID)
+
+
+@st.cache_data(ttl=300)
+def load_tab(tab_name: str) -> pd.DataFrame:
     try:
-        from data_store import (
-            load_daily_snapshot,
-            load_stock_history,
-            load_theme_daily
-        )
-        snapshot = load_daily_snapshot()
-        history  = load_stock_history()
-        themes   = load_theme_daily()
-        return snapshot, history, themes
+        ss = get_spreadsheet()
+        if ss is None:
+            return pd.DataFrame()
+        ws = ss.worksheet(tab_name)
+        data = ws.get_all_records()
+        return pd.DataFrame(data)
     except Exception as e:
-        st.error(f"데이터 로드 실패: {e}")
-        return [], [], []
+        st.warning(f"{tab_name} 탭 로드 실패: {e}")
+        return pd.DataFrame()
 
 
-def get_today_data(snapshot: list) -> dict:
-    """오늘 날짜 데이터만 필터링 → 3트랙 분리"""
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_rows = [r for r in snapshot if str(r.get("날짜", "")) == today]
+# ────────────────────────────────────────────
+# 사이드바
+# ────────────────────────────────────────────
+def render_sidebar(today_df: pd.DataFrame, theme_df: pd.DataFrame):
+    with st.sidebar:
+        st.image("https://via.placeholder.com/200x60?text=Andy+Jo+AI", width=200)
+        st.markdown("---")
 
-    result = {"READY": [], "BUY_NOW": [], "LAUNCHED": []}
-    for row in today_rows:
-        track = row.get("트랙", "")
-        if track in result:
-            result[track].append(row)
+        # 오늘 날짜
+        today = datetime.now().strftime("%Y-%m-%d")
+        st.markdown(f"**📅 기준일:** {today}")
 
-    # 점수 기준 정렬
-    for track in result:
-        result[track].sort(key=lambda x: -float(x.get("총점", 0) or 0))
+        # 종목 수 요약
+        if not today_df.empty:
+            today_data = today_df[today_df["날짜"] == today] if "날짜" in today_df.columns else today_df
+            core_n    = len(today_data[today_data["트랙"] == "CORE"])
+            buy_n     = len(today_data[today_data["트랙"] == "BUY_NOW"])
+            ready_n   = len(today_data[today_data["트랙"] == "READY"])
+            launch_n  = len(today_data[today_data["트랙"] == "LAUNCHED"])
 
-    return result
+            st.markdown("### 오늘 결과")
+            st.metric("🔴 CORE",     core_n)
+            st.metric("🟠 BUY NOW",  buy_n)
+            st.metric("🟡 READY",    ready_n)
+            st.metric("🚀 LAUNCHED", launch_n)
+
+        # TOP 테마
+        if not theme_df.empty:
+            today_theme = theme_df[theme_df["날짜"] == today] if "날짜" in theme_df.columns else theme_df
+            if not today_theme.empty:
+                top = today_theme.sort_values("점수", ascending=False).iloc[0]
+                st.markdown("---")
+                st.markdown(f"**🔥 TOP 테마:** {top['테마명']}")
+                st.markdown(f"점수: **{top['점수']}점** {top.get('등급','')}")
+
+        st.markdown("---")
+        st.markdown("**점수 기준표**")
+        st.markdown("""
+| 점수 | 등급 |
+|------|------|
+| 8-10 | 🔴 CORE (강력매수) |
+| 6-7.9 | 🟠 BUY NOW |
+| 4-5.9 | 🟡 READY (관심) |
+| 2-3.9 | ⚪ 관망 |
+""")
+        st.markdown("**테마 온도 기준**")
+        st.markdown("""
+| 점수 | 상태 |
+|------|------|
+| ≥8 | 🔥🔥 과열 |
+| 6-7.9 | 🔥 활성 (최적진입) |
+| 4-5.9 | 📈 형성중 |
+| 2-3.9 | 👀 워밍업 |
+| <2 | 💤 미활성 |
+""")
 
 
-def get_today_themes(themes: list) -> list:
-    """오늘 테마 데이터 정렬"""
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_themes = [t for t in themes if str(t.get("날짜", "")) == today]
-    today_themes.sort(key=lambda x: -float(x.get("온도점수", 0) or 0))
-    return today_themes
+# ────────────────────────────────────────────
+# 종목 카드 렌더링
+# ────────────────────────────────────────────
+def render_stock_card(row: pd.Series):
+    track = row.get("트랙", "READY")
+    style = TRACK_STYLE.get(track, TRACK_STYLE["READY"])
+    icon  = style["icon"]
+    color = style["color"]
 
+    name     = row.get("종목명", "")
+    code     = row.get("코드", "")
+    price    = row.get("현재가", 0)
+    change   = row.get("등락률", 0)
+    marcap   = row.get("시총(억)", 0)
+    fin_sc   = row.get("재무점수", 0)
+    theme_sc = row.get("테마점수", 0)
+    theme_nm = row.get("테마명", "")
+    reason   = row.get("선정이유", "")
+    warnings = row.get("주의사항", "")
+    manual   = row.get("수동확인항목", "")
+    naver_url= row.get("네이버링크", f"https://finance.naver.com/item/main.nhn?code={code}")
+    dart_url = row.get("DART링크", f"https://dart.fss.or.kr/dsab007/detailSearch.do?textCrpNm={name}")
+    debt     = row.get("부채비율", "")
+    reserve  = row.get("유보율", "")
+    holder   = row.get("최대주주지분", "")
+    cb_bw    = row.get("CB/BW여부", "N")
+    pos52    = row.get("52주위치", "")
 
-# ────────────────────────────────────────
-# 헤더
-# ────────────────────────────────────────
-def render_header(today_data: dict):
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.markdown('<div class="main-header">📈 Andy Jo Stock AI</div>', unsafe_allow_html=True)
+    change_color = "#ff4b4b" if float(change or 0) > 0 else "#4fc3f7"
+    change_str   = f"+{change}%" if float(change or 0) > 0 else f"{change}%"
+    cb_badge     = "⚠️CB/BW" if cb_bw == "Y" else ""
+
+    with st.container():
         st.markdown(
-            f'<div class="sub-header">시간여행TV 기준 자동 스크리닝 | '
-            f'업데이트: {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>',
+            f"""
+            <div style="border-left: 4px solid {color}; padding: 12px 16px;
+                        background:#1e1e2e; border-radius:8px; margin-bottom:12px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-size:18px; font-weight:bold; color:{color};">
+                        {icon} {name} <span style="font-size:13px; color:#888;">({code})</span>
+                    </span>
+                    <span style="font-size:16px; font-weight:bold; color:{change_color};">
+                        {price:,}원 &nbsp; {change_str}
+                    </span>
+                </div>
+                <div style="margin-top:6px; font-size:13px; color:#aaa;">
+                    시총 {marcap}억 &nbsp;|&nbsp; 재무점수 <b style="color:#ffd700;">{fin_sc}점</b>
+                    &nbsp;|&nbsp; 테마점수 <b style="color:#ffa500;">{theme_sc}점</b>
+                    &nbsp;|&nbsp; 테마: {theme_nm}
+                    &nbsp; {cb_badge}
+                </div>
+            </div>
+            """,
             unsafe_allow_html=True
         )
-    with col2:
-        r = len(today_data.get("READY", []))
-        b = len(today_data.get("BUY_NOW", []))
-        l = len(today_data.get("LAUNCHED", []))
-        st.markdown(f"""
-        <div style="text-align:right; padding-top:0.5rem;">
-            <span style="color:#FFD700; font-weight:700;">🟡 READY {r}</span>&nbsp;&nbsp;
-            <span style="color:#00FF88; font-weight:700;">🟢 BUY NOW {b}</span>&nbsp;&nbsp;
-            <span style="color:#FF6B6B; font-weight:700;">🚀 LAUNCHED {l}</span>
-        </div>
-        """, unsafe_allow_html=True)
+
+        with st.expander(f"📋 {name} 상세 보기"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**자동 검증 항목**")
+                st.markdown(f"- 부채비율: `{debt}%`")
+                st.markdown(f"- 유보율: `{reserve}%`")
+                st.markdown(f"- 최대주주지분: `{holder}%`")
+                st.markdown(f"- 52주 위치: `{pos52}`")
+                st.markdown(f"- CB/BW 여부: `{cb_bw}`")
+            with col2:
+                st.markdown("**선정 이유**")
+                st.info(reason if reason else "이유 없음")
+
+            if warnings:
+                st.markdown("**⚠️ 주의사항**")
+                for w in warnings.split(";"):
+                    if w.strip():
+                        st.warning(w.strip())
+
+            if manual:
+                st.markdown("**🔍 수동 확인 필요 항목**")
+                for m in manual.split(";"):
+                    if m.strip():
+                        st.markdown(f"- [ ] {m.strip()}")
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.link_button("📊 네이버 금융", naver_url)
+            with col_b:
+                st.link_button("📄 DART 공시", dart_url)
 
 
-# ────────────────────────────────────────
-# 탭 1: 오늘의 테마
-# ────────────────────────────────────────
-def render_theme_tab(today_themes: list):
-    st.subheader("🌡️ 오늘의 테마 온도 TOP 10")
-
-    if not today_themes:
-        st.info("오늘 테마 데이터가 없습니다. 파이프라인 실행 후 확인해주세요.")
+# ────────────────────────────────────────────
+# 탭별 렌더링
+# ────────────────────────────────────────────
+def render_tab_stocks(today_df: pd.DataFrame, track: str):
+    today = datetime.now().strftime("%Y-%m-%d")
+    if today_df.empty:
+        st.info("데이터가 없습니다. 파이프라인을 실행해 주세요.")
         return
 
-    top10 = today_themes[:10]
+    data = today_df[today_df["날짜"] == today] if "날짜" in today_df.columns else today_df
+    data = data[data["트랙"] == track]
 
-    for i, theme in enumerate(top10, 1):
-        name  = theme.get("테마명", "")
-        score = float(theme.get("온도점수", 0) or 0)
-        news  = float(theme.get("뉴스신호", 0) or 0)
-        vol   = float(theme.get("거래량신호", 0) or 0)
-        price = float(theme.get("주가신호", 0) or 0)
-        comm  = float(theme.get("커뮤니티신호", 0) or 0)
-
-        # 온도 색상
-        if score >= 7:   color = "#00FF88"
-        elif score >= 4: color = "#FFD700"
-        else:            color = "#888888"
-
-        with st.container():
-            col1, col2, col3, col4, col5, col6 = st.columns([0.3, 1.5, 1, 1, 1, 1])
-            col1.markdown(f"**{i}위**")
-            col2.markdown(f"**{name}**")
-            col3.metric("온도", f"{score:.1f}점", delta=None)
-            col4.metric("뉴스", f"{news:.1f}")
-            col5.metric("거래량", f"{vol:.1f}")
-            col6.metric("커뮤니티", f"{comm:.1f}")
-
-        # 온도 게이지 바
-        bar_width = min(int(score * 10), 100)
-        st.markdown(f"""
-        <div style="background:#2A2A3E; border-radius:4px; height:6px; margin-bottom:0.8rem;">
-            <div style="width:{bar_width}%; height:6px; border-radius:4px;
-                        background:linear-gradient(90deg, {color}, {color}88);"></div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.divider()
-
-    # 테마 전체 표
-    if len(today_themes) > 10:
-        with st.expander(f"전체 테마 보기 ({len(today_themes)}개)"):
-            df = pd.DataFrame(today_themes)[["테마명", "온도점수", "뉴스신호", "거래량신호", "주가신호", "커뮤니티신호", "랭킹"]]
-            st.dataframe(df, use_container_width=True)
-
-
-# ────────────────────────────────────────
-# 탭 2: BUY NOW
-# ────────────────────────────────────────
-def render_buynow_tab(buy_now: list):
-    st.subheader("🟢 BUY NOW — 지금 바로 볼 종목")
-    st.caption("L0-L6 전부 통과 + 테마 점수 높음 + 거래량 급등 + 가격 타이밍 최적")
-
-    if not buy_now:
-        st.info("오늘 BUY NOW 종목이 없습니다.")
+    if data.empty:
+        st.info(f"오늘 {track} 종목이 없습니다.")
         return
 
-    for s in buy_now[:20]:
-        code   = s.get("종목코드", "")
-        name   = s.get("종목명", "")
-        score  = s.get("총점", 0)
-        themes = s.get("테마", "")
-        mktcap = s.get("시가총액(억)", "")
-        vol_r  = s.get("거래량비율", "")
-        price  = s.get("현재가", "")
-        low52  = s.get("52주저점", "")
-
-        with st.expander(f"🟢 {name} ({code}) — 총점 {score}점 | {themes}"):
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("시가총액", f"{mktcap}억")
-            col2.metric("현재가", f"{price}원")
-            col3.metric("52주 저점", f"{low52}원")
-            col4.metric("거래량비율", f"{vol_r}배")
-
-            st.markdown(f"""
-            - **테마:** {themes}
-            - **총점:** {score}점
-            - **네이버 증권:** [바로가기](https://finance.naver.com/item/main.naver?code={code})
-            """)
+    st.markdown(f"**총 {len(data)}종목**")
+    for _, row in data.iterrows():
+        render_stock_card(row)
 
 
-# ────────────────────────────────────────
-# 탭 3: READY
-# ────────────────────────────────────────
-def render_ready_tab(ready: list):
-    st.subheader("🟡 READY — 미리 담아두는 준비 종목")
-    st.caption("재무·주주구조 우수, 아직 테마 미반영 — 테마 붙으면 BUY NOW로 자동 전환")
-
-    if not ready:
-        st.info("오늘 READY 종목이 없습니다.")
+def render_tab_theme(theme_df: pd.DataFrame):
+    today = datetime.now().strftime("%Y-%m-%d")
+    if theme_df.empty:
+        st.info("테마 데이터가 없습니다.")
         return
 
-    # 표 형식으로 표시
-    df_data = []
-    for s in ready[:50]:
-        df_data.append({
-            "종목코드": s.get("종목코드", ""),
-            "종목명":   s.get("종목명", ""),
-            "총점":     s.get("총점", 0),
-            "시가총액(억)": s.get("시가총액(억)", ""),
-            "테마":     s.get("테마", "없음"),
-            "현재가":   s.get("현재가", ""),
-            "52주저점": s.get("52주저점", ""),
-            "거래량비율": s.get("거래량비율", ""),
-        })
+    data = theme_df[theme_df["날짜"] == today] if "날짜" in theme_df.columns else theme_df
+    data = data.sort_values("점수", ascending=False)
 
-    df = pd.DataFrame(df_data)
-    st.dataframe(
-        df,
-        use_container_width=True,
-        column_config={
-            "종목코드": st.column_config.TextColumn("코드", width=70),
-            "종목명":   st.column_config.TextColumn("종목명", width=100),
-            "총점":     st.column_config.NumberColumn("총점", format="%.1f"),
-            "시가총액(억)": st.column_config.NumberColumn("시총(억)", format="%.0f"),
-            "테마":     st.column_config.TextColumn("테마", width=150),
-            "현재가":   st.column_config.NumberColumn("현재가", format="%.0f"),
-            "52주저점": st.column_config.NumberColumn("52주저점", format="%.0f"),
-            "거래량비율": st.column_config.NumberColumn("거래량비율", format="%.2f"),
-        }
-    )
+    st.markdown("### 오늘의 테마 온도")
+    for _, row in data.iterrows():
+        grade = row.get("등급", "")
+        color = GRADE_COLOR.get(grade, "#888888")
+        score = row.get("점수", 0)
+        bar_w = int(float(score) * 10)
+
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; margin-bottom:8px;">
+                <div style="width:120px; font-weight:bold;">{row.get('테마명','')}</div>
+                <div style="width:{bar_w}%; background:{color}; height:20px;
+                            border-radius:4px; margin:0 10px;"></div>
+                <div style="color:{color}; font-weight:bold;">{score}점 {grade}</div>
+                <div style="color:#888; margin-left:12px; font-size:12px;">
+                    뉴스 {row.get('뉴스건수',0)}건
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
 
-# ────────────────────────────────────────
-# 탭 4: LAUNCHED
-# ────────────────────────────────────────
-def render_launched_tab(launched: list):
-    st.subheader("🚀 LAUNCHED — 이미 출발한 종목")
-    st.caption("20일 수익률 30% 이상 — 놓친 종목 기록 / 다음 기회 참고용")
-
-    if not launched:
-        st.info("오늘 LAUNCHED 종목이 없습니다.")
+def render_tab_history(history_df: pd.DataFrame):
+    if history_df.empty:
+        st.info("히스토리 데이터가 없습니다.")
         return
 
-    df_data = []
-    for s in launched[:50]:
-        gain = s.get("20일수익률", 0)
+    st.markdown("### 종목 팔로우업 히스토리")
+    df_show = history_df[[
+        "종목명", "종목코드", "최초진입일", "최초트랙",
+        "현재트랙", "최초가격", "현재가격", "수익률(%)", "최근업데이트"
+    ]].copy()
+
+    # 수익률 색상
+    def highlight_ret(val):
         try:
-            gain_f = float(gain)
+            v = float(val)
+            return "color: #ff4b4b;" if v > 0 else ("color: #4fc3f7;" if v < 0 else "")
         except Exception:
-            gain_f = 0
-
-        df_data.append({
-            "종목코드":   s.get("종목코드", ""),
-            "종목명":     s.get("종목명", ""),
-            "20일수익률": gain_f,
-            "테마":       s.get("테마", ""),
-            "시가총액(억)": s.get("시가총액(억)", ""),
-        })
-
-    df = pd.DataFrame(df_data)
-    df = df.sort_values("20일수익률", ascending=False)
+            return ""
 
     st.dataframe(
-        df,
+        df_show.style.applymap(highlight_ret, subset=["수익률(%)"]),
         use_container_width=True,
-        column_config={
-            "20일수익률": st.column_config.NumberColumn(
-                "20일 수익률(%)",
-                format="%.1f%%",
-            ),
-        }
+        height=500
     )
 
 
-# ────────────────────────────────────────
-# 탭 5: 팔로우업
-# ────────────────────────────────────────
-def render_followup_tab(history: list):
-    st.subheader("📋 팔로우업 — 종목 이력 카드")
-    st.caption("최초 포착일부터 현재까지 트랙 변경 이력 전체 기록")
-
-    if not history:
-        st.info("이력 데이터가 없습니다.")
+def render_tab_alerts(alerts_df: pd.DataFrame):
+    if alerts_df.empty:
+        st.info("알림 내역이 없습니다.")
         return
 
-    # 검색 필터
-    search = st.text_input("종목명 또는 코드 검색", placeholder="예: 한화에어로, 012450")
-
-    filtered = history
-    if search:
-        filtered = [
-            h for h in history
-            if search in str(h.get("종목명", "")) or search in str(h.get("종목코드", ""))
-        ]
-
-    st.caption(f"총 {len(filtered)}종목 이력")
-
-    for h in filtered[:30]:
-        code    = h.get("종목코드", "")
-        name    = h.get("종목명", "")
-        first   = h.get("최초진입일", "")
-        track   = h.get("현재트랙", "")
-        history_log = h.get("트랙변경이력", "")
-        best_score  = h.get("최고점수", "")
-        buy_date    = h.get("BUY_NOW전환일", "")
-        launch_date = h.get("LAUNCHED전환일", "")
-
-        badge_color = {
-            "READY": "#FFD700",
-            "BUY_NOW": "#00FF88",
-            "LAUNCHED": "#FF6B6B"
-        }.get(track, "#888888")
-
-        with st.expander(f"{name} ({code}) — 최초 {first} 진입 | 현재: {track}"):
-            col1, col2, col3 = st.columns(3)
-            col1.metric("최초 진입일", first)
-            col2.metric("최고 점수", best_score)
-            col3.metric("현재 트랙", track)
-
-            st.markdown(f"**트랙 변경 이력:** {history_log}")
-
-            timeline = []
-            if first:        timeline.append(f"📌 {first} 최초 진입")
-            if buy_date:     timeline.append(f"🟢 {buy_date} BUY NOW 전환")
-            if launch_date:  timeline.append(f"🚀 {launch_date} LAUNCHED 전환")
-
-            for t in timeline:
-                st.markdown(f"- {t}")
-
-            st.markdown(
-                f"[네이버 증권 바로가기](https://finance.naver.com/item/main.naver?code={code})"
-            )
+    st.markdown("### 알림 이력")
+    st.dataframe(alerts_df.sort_values("일시", ascending=False), use_container_width=True)
 
 
-# ────────────────────────────────────────
-# 메인 실행
-# ────────────────────────────────────────
+# ────────────────────────────────────────────
+# 메인
+# ────────────────────────────────────────────
 def main():
-    snapshot, history, themes = load_data()
-    today_data   = get_today_data(snapshot)
-    today_themes = get_today_themes(themes)
+    # 데이터 로드
+    today_df   = load_tab("TODAY")
+    history_df = load_tab("HISTORY")
+    alerts_df  = load_tab("ALERTS")
+    theme_df   = load_tab("THEME")
 
-    render_header(today_data)
+    # 사이드바
+    render_sidebar(today_df, theme_df)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🌡️ 오늘의 테마",
-        "🟢 BUY NOW",
-        "🟡 READY",
-        "🚀 LAUNCHED",
-        "📋 팔로우업"
+    # 타이틀
+    st.markdown(
+        "<h1 style='color:#ffd700;'>📈 Andy Jo 주식 AI</h1>"
+        "<p style='color:#888;'>시간여행TV 기준 소형주 자동선정 시스템</p>",
+        unsafe_allow_html=True
+    )
+
+    # 새로고침
+    if st.button("🔄 데이터 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("---")
+
+    # 메인 탭
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "🔴 CORE", "🟠 BUY NOW", "🟡 READY", "🚀 LAUNCHED", "🌡️ 테마온도", "📊 팔로우업"
     ])
 
     with tab1:
-        render_theme_tab(today_themes)
-    with tab2:
-        render_buynow_tab(today_data.get("BUY_NOW", []))
-    with tab3:
-        render_ready_tab(today_data.get("READY", []))
-    with tab4:
-        render_launched_tab(today_data.get("LAUNCHED", []))
-    with tab5:
-        render_followup_tab(history)
+        st.markdown("### 🔴 CORE — 핵심 매수 종목")
+        st.caption("재무 + 테마 + 타이밍 모두 최상위 조건 충족")
+        render_tab_stocks(today_df, "CORE")
 
-    # 새로고침 버튼
-    st.divider()
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        if st.button("🔄 데이터 새로고침", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    with tab2:
+        st.markdown("### 🟠 BUY NOW — 즉시 매수 검토")
+        st.caption("테마 뉴스 3건 이상 + 거래량 200% 이상")
+        render_tab_stocks(today_df, "BUY_NOW")
+
+    with tab3:
+        st.markdown("### 🟡 READY — 관심 종목 (예비 대기)")
+        st.caption("기본 조건 통과, 진입 타이밍 대기 중")
+        render_tab_stocks(today_df, "READY")
+
+    with tab4:
+        st.markdown("### 🚀 LAUNCHED — 이미 급등 종목")
+        st.caption("⚠️ 추격매수 위험. 참고용으로만 활용하세요.")
+        render_tab_stocks(today_df, "LAUNCHED")
+
+    with tab5:
+        render_tab_theme(theme_df)
+
+    with tab6:
+        col_h, col_a = st.columns([3, 1])
+        with col_h:
+            render_tab_history(history_df)
+        with col_a:
+            render_tab_alerts(alerts_df)
 
 
 if __name__ == "__main__":
