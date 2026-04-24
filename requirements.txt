@@ -7,7 +7,7 @@ html5lib==1.1
 
 # 주식 데이터
 pykrx==1.0.45
-FinanceDataReader
+finance-datareader
 
 # 데이터 처리
 pandas==2.1.4
