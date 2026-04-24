@@ -54,61 +54,64 @@ IR_PUFF_KEYWORDS = [
 # ────────────────────────────────────────
 # 1. 전체 공시 배치 조회 (핵심 — 1회만 호출)
 # ────────────────────────────────────────
-def fetch_disclosure_batch(days=14):
+def fetch_disclosure_batch(days: int = 14) -> dict:
     """
-    최근 N일 전체 공시를 1회 배치 조회
-    반환: {corp_code: [공시제목, ...]}
+    DART 전체 공시 배치 조회 (타임아웃 + 빠른 실패 적용)
+    반환: {corp_code: [title1, title2, ...]}
     """
-    if not DART_API_KEY:
-        log.warning("DART_API_KEY 없음 — 공시 조회 스킵")
-        return {}
+    import datetime as dt
 
-    end   = datetime.now()
-    start = end - timedelta(days=days)
+    end_dt   = dt.date.today()
+    start_dt = end_dt - dt.timedelta(days=days)
+    bgn_de   = start_dt.strftime("%Y%m%d")
+    end_de   = end_dt.strftime("%Y%m%d")
 
-    all_disclosures = {}
-    total_count = 0
+    disclosure_map: dict = {}
+    total_items = 0
 
-    try:
-        for page in range(1, 21):  # 최대 20페이지 = 2,000건
-            params = {
-                "crtfc_key": DART_API_KEY,
-                "bgn_de":    start.strftime("%Y%m%d"),
-                "end_de":    end.strftime("%Y%m%d"),
-                "page_count": 100,
-                "page_no":   page,
-            }
+    log.info(f"[dart_engine] 공시 배치 조회: {bgn_de} - {end_de}")
+
+    for page in range(1, 21):   # 최대 20페이지
+        try:
             resp = requests.get(
                 f"{DART_BASE}/list.json",
-                params=params, timeout=15
+                params={
+                    "crtfc_key": DART_API_KEY,
+                    "bgn_de":    bgn_de,
+                    "end_de":    end_de,
+                    "page_no":   page,
+                    "page_count": 100,
+                },
+                timeout=10   # ★ 10초 타임아웃
             )
             data = resp.json()
+        except requests.exceptions.Timeout:
+            log.warning(f"  → 페이지 {page} 타임아웃 — 배치 조회 중단")
+            break
+        except Exception as e:
+            log.warning(f"  → 페이지 {page} 오류: {e} — 중단")
+            break
 
-            if data.get("status") != "000":
-                break
+        if data.get("status") != "000":
+            log.info(f"  → 페이지 {page} 종료 (status={data.get('status')})")
+            break
 
-            items = data.get("list", [])
-            if not items:
-                break
+        items = data.get("list", [])
+        if not items:
+            break
 
-            for item in items:
-                corp  = item.get("corp_code", "")
-                title = item.get("report_nm", "")
-                if corp:
-                    if corp not in all_disclosures:
-                        all_disclosures[corp] = []
-                    all_disclosures[corp].append(title)
-                    total_count += 1
+        for item in items:
+            corp_code = item.get("corp_code", "")
+            title     = item.get("report_nm", "")
+            if corp_code:
+                disclosure_map.setdefault(corp_code, []).append(title)
+        total_items += len(items)
 
-        log.info(
-            f"공시 배치 조회 완료: "
-            f"{len(all_disclosures)}개 기업 / {total_count}건"
-        )
-        return all_disclosures
+        if len(items) < 100:
+            break   # 마지막 페이지
 
-    except Exception as e:
-        log.error(f"공시 배치 조회 실패: {e}")
-        return {}
+    log.info(f"[dart_engine] 공시 배치 완료: {len(disclosure_map)}개 기업 / {total_items}건")
+    return disclosure_map
 
 
 # ────────────────────────────────────────
