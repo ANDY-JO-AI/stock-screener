@@ -10,8 +10,8 @@ pykrx==1.0.45
 finance-datareader
 
 # 데이터 처리
-pandas==2.1.4
-numpy==1.26.2
+pandas==2.2.2
+numpy==1.26.4
 
 # Google Sheets 연동
 gspread==5.12.0
