@@ -1,627 +1,461 @@
-# filter_engine.py — 코스닥 전용, 실시간 진행 표시, 시간여행TV L0-L6 완전 반영
-# 로컬 실행: python filter_engine.py
-# GitHub Actions: python filter_engine.py 동일하게 실행
+"""
+Andy Jo Stock AI — 종목 필터링 엔진 (3트랙 완전 재설계)
+L0 우주 → L1 즉시탈락 → L2 재무 → L3 유동성 → L4 DART → L5 테마 → L6 타이밍
+결과: READY / BUY_NOW / LAUNCHED 3트랙 분류
+"""
 
-import os, time, warnings, re, json, zipfile, io, sys
+import os
+import time
+import logging
 import pandas as pd
-import requests
 from datetime import datetime, timedelta
 
+log = logging.getLogger(__name__)
 
-from data_store import save_candidates, load_news_data as get_saved_news
-
-warnings.filterwarnings("ignore")
-
-# ─────────────────────────────────────────
+# ────────────────────────────────────────
 # 설정값
-# ─────────────────────────────────────────
-DART_KEY = os.environ.get("DART_API_KEY", "")
-MAX_WORKERS = 1          # 로컬 안정성: 단일 스레드
-STOCK_TIMEOUT = 30       # 종목당 최대 분석 시간(초)
-SAVE_INTERVAL = 10       # N종목마다 중간 저장
-MIN_FINAL_SCORE = 5      # 최소 총점 (이 이상만 결과에 포함)
-TOP_N = 50               # 최종 저장 종목 수
+# ────────────────────────────────────────
+MKTCAP_MIN   = 150   # 시가총액 최소 (억원)
+MKTCAP_MAX   = 700   # 시가총액 최대 (억원)
+MIN_SCORE    = 5     # 최종 통과 최소 점수
+TOP_N        = 50    # 최종 출력 종목 수
 
-# 시총 기준 (단위: 억원)
-MKTCAP_MIN = 150
-MKTCAP_MAX = 700
-
-# 제거 키워드
-BAD_KW = [
-    "스팩", "SPAC", "리츠", "REIT", " 우", "홀딩스",
-    "제1", "제2", "ETF", "ETN", "인버스", "레버리지",
-    "중국", "China", "선박", "해운"
+# 즉시 탈락 키워드 (공시 제목 기준)
+REJECT_KEYWORDS = [
+    "전환사채", "신주인수권부사채", "유상증자", "제3자배정",
+    "횡령", "배임", "불성실공시", "상장폐지",
+    "자본잠식", "워크아웃", "회생절차", "최대주주변경"
 ]
 
-MEZZANINE_KW = [
-    "전환사채", "신주인수권부사채", "유상증자 결정",
-    "신주인수권 행사", "전환가액 조정"
-]
-
-HYPE_KW = [
-    "신사업 진출", "MOU", "업무협약", "양해각서",
-    "계약 체결", "수주"
-]
-
-THEME_DICT = {
-    "방산":     ["방산","방위","탄약","레이더","한화","빅텍","퍼스텍","휴니드","LIG","SNT"],
-    "로봇/AI":  ["로봇","AI","자율","협동로봇","뉴로","레인보우","인공지능","자동화"],
-    "2차전지":  ["배터리","전지","양극재","음극재","에코프로","엘앤에프","포스코","솔루스"],
-    "바이오":   ["바이오","신약","임상","제약","헬스케어","의료","진단","치료"],
-    "반도체":   ["반도체","웨이퍼","파운드리","HBM","메모리","칩","소부장"],
-    "조선":     ["조선","선박","LNG선","해양","크레인","도크"],
-    "원전":     ["원전","원자력","SMR","핵융합","두산에너빌","한전"],
-    "정치테마": ["정치","대선","총선","후보","여당","야당","대통령"],
-    "대북":     ["대북","통일","남북","철도","개성","북한"],
-    "미세먼지": ["미세먼지","공기청정","마스크","황사","필터"],
-    "조류독감": ["조류독감","구제역","살처분","수산","축산","방역"],
-    "에너지":   ["태양광","풍력","수소","신재생","ESS","연료전지"],
-    "건설":     ["건설","재건축","시공","주택","리모델링","인테리어"],
-    "엔터":     ["엔터","K-POP","드라마","콘텐츠","영화","음반","아이돌"],
-    "저출산":   ["저출산","출산","육아","보육","어린이","유아"],
-    "우주":     ["우주","위성","발사체","항공","드론","UAM"],
-    "헬스케어": ["헬스케어","웰니스","의료기기","병원","체외진단"],
+# 테마 관련 키워드 (L5 채점용)
+THEME_KEYWORDS = {
+    "방산":     ["방산", "방위", "무기", "미사일", "군수", "K방산"],
+    "원전":     ["원전", "원자력", "SMR", "핵융합"],
+    "로봇_AI":  ["로봇", "협동로봇", "AI로봇", "휴머노이드"],
+    "AI반도체": ["AI반도체", "HBM", "NPU", "파운드리"],
+    "2차전지":  ["배터리", "2차전지", "양극재", "음극재", "전고체"],
+    "바이오":   ["바이오", "신약", "ADC", "mRNA", "임상"],
+    "조선":     ["조선", "LNG선", "컨테이너선", "수주잔고"],
+    "건설":     ["재건축", "재개발", "PF", "리츠"],
+    "우주항공": ["우주", "위성", "발사체", "누리호"],
+    "수소":     ["수소", "연료전지", "그린수소"],
+    "가상화폐": ["비트코인", "코인", "블록체인", "가상자산"],
+    "게임":     ["게임", "메타버스", "P2E"],
+    "엔터":     ["K팝", "아이돌", "엔터", "한류"],
+    "반도체장비":["반도체장비", "식각", "증착", "CMP"],
+    "자동차":   ["전기차", "자율주행", "전장", "ADAS"],
 }
 
-# ─────────────────────────────────────────
-# DART 유틸
-# ─────────────────────────────────────────
-_DART_CORP_MAP = {}
 
-def get_dart_corp_map() -> dict:
-    """DART 전체 기업 코드 매핑 (종목코드 → corp_code)"""
-    global _DART_CORP_MAP
-    if _DART_CORP_MAP:
-        return _DART_CORP_MAP
-    if not DART_KEY:
-        print("[DART] API 키 없음 — 재무 데이터 스킵")
-        return {}
-    try:
-        print("[DART] 기업 코드 다운로드 중...")
-        url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={DART_KEY}"
-        r = requests.get(url, timeout=60)
-        import zipfile, io, xml.etree.ElementTree as ET
-        zf = zipfile.ZipFile(io.BytesIO(r.content))
-        xml_data = zf.read("CORPCODE.xml")
-        root = ET.fromstring(xml_data)
-        for item in root.findall("list"):
-            stock_code = item.findtext("stock_code", "").strip()
-            corp_code  = item.findtext("corp_code", "").strip()
-            if stock_code:
-                _DART_CORP_MAP[stock_code] = corp_code
-        print(f"[DART] 기업 코드 {len(_DART_CORP_MAP)}건 로드 완료")
-    except Exception as e:
-        print(f"[DART] 기업 코드 로드 실패: {e}")
-    return _DART_CORP_MAP
-
-
-def get_dart_financials(corp_code: str, year: int) -> dict:
-    """DART 단일 기업 재무제표 (연결/개별)"""
-    if not DART_KEY or not corp_code:
-        return {}
-    try:
-        url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
-        params = {
-            "crtfc_key": DART_KEY,
-            "corp_code": corp_code,
-            "bsns_year": str(year),
-            "reprt_code": "11011",  # 사업보고서
-            "fs_div": "CFS",        # 연결재무제표
-        }
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-        if data.get("status") != "000":
-            # 연결 없으면 개별로 재시도
-            params["fs_div"] = "OFS"
-            r = requests.get(url, params=params, timeout=15)
-            data = r.json()
-        if data.get("status") != "000":
-            return {}
-        result = {}
-        for item in data.get("list", []):
-            nm  = item.get("account_nm", "")
-            val = item.get("thstrm_amount", "0") or "0"
-            try:
-                result[nm] = int(val.replace(",", ""))
-            except Exception:
-                result[nm] = 0
-        return result
-    except Exception:
-        return {}
-
-
-def get_dart_disclosures(corp_code: str, days: int = 730) -> list:
-    """DART 최근 N일 공시 목록"""
-    if not DART_KEY or not corp_code:
-        return []
-    try:
-        start = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
-        end   = datetime.today().strftime("%Y%m%d")
-        url   = "https://opendart.fss.or.kr/api/list.json"
-        params = {
-            "crtfc_key": DART_KEY,
-            "corp_code": corp_code,
-            "bgn_de": start,
-            "end_de": end,
-            "page_count": 100,
-        }
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-        if data.get("status") != "000":
-            return []
-        return [item.get("report_nm", "") for item in data.get("list", [])]
-    except Exception:
-        return []
-
-
-# ─────────────────────────────────────────
-# FDR 유틸
-# ─────────────────────────────────────────
-def safe_fdr_load(code: str, start: str, end: str) -> pd.DataFrame:
-    """FinanceDataReader 안전 로드"""
-    try:
-        import FinanceDataReader as fdr
-        df = fdr.DataReader(code, start, end)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-
-# ─────────────────────────────────────────
-# LAYER 0 — 유니버스 구성
-# ─────────────────────────────────────────
+# ────────────────────────────────────────
+# L0: KOSDAQ 유니버스 로드
+# ────────────────────────────────────────
 def load_kosdaq_universe() -> pd.DataFrame:
-    """코스닥 전종목 로드 (시총 필터 포함)"""
+    """
+    KOSDAQ 전종목 로드 → 시가총액 150-700억 필터
+    반환: DataFrame [code, name, mktcap]
+    """
     try:
         import FinanceDataReader as fdr
-        print("[L0] 코스닥 종목 목록 로드 중...")
         df = fdr.StockListing("KOSDAQ")
-        if df is None or df.empty:
-            print("[L0] 코스닥 목록 로드 실패")
-            return pd.DataFrame()
-
-        # 컬럼 정규화
-                # 실제 컬럼명 기반 직접 매핑
         df = df.rename(columns={
-            "Code":   "code",
-            "Name":   "name",
-            "Marcap": "mktcap",
+            "Code": "code", "Name": "name",
+            "Marcap": "mktcap", "Market": "market"
         })
-
-
-        required = {"code", "name", "mktcap"}
-        missing = required - set(df.columns)
-        if missing:
-            print(f"[L0] 필수 컬럼 없음: {missing}")
-            return pd.DataFrame()
-
         df["mktcap"] = pd.to_numeric(df["mktcap"], errors="coerce").fillna(0)
         df["mktcap_억"] = df["mktcap"] / 1e8
 
-        # 시총 필터
-        df = df[(df["mktcap_억"] >= MKTCAP_MIN) & (df["mktcap_억"] <= MKTCAP_MAX)]
+        filtered = df[
+            (df["mktcap_억"] >= MKTCAP_MIN) &
+            (df["mktcap_억"] <= MKTCAP_MAX)
+        ].copy()
 
-        # 불량 키워드 제거
-        for kw in BAD_KW:
-            df = df[~df["name"].str.contains(kw, na=False)]
+        log.info(f"L0 유니버스: KOSDAQ {len(df)}종목 → 시가총액 필터 후 {len(filtered)}종목")
+        return filtered[["code", "name", "mktcap_억"]].reset_index(drop=True)
 
-        df["code"] = df["code"].astype(str).str.zfill(6)
-        df = df.reset_index(drop=True)
-        print(f"[L0] 코스닥 유니버스: {len(df)}종목 (시총 {MKTCAP_MIN}억-{MKTCAP_MAX}억)")
-        return df[["code", "name", "mktcap_억"]]
     except Exception as e:
-        print(f"[L0] 유니버스 로드 오류: {e}")
-        return pd.DataFrame()
+        log.error(f"L0 유니버스 로드 실패: {e}")
+        return pd.DataFrame(columns=["code", "name", "mktcap_억"])
 
 
-# ─────────────────────────────────────────
-# LAYER 1 — 즉시 탈락 필터
-# ─────────────────────────────────────────
-def check_l1_reject(code: str, name: str, corp_code: str,
-                    disclosures: list, price_df: pd.DataFrame) -> tuple:
+# ────────────────────────────────────────
+# L1: 즉시 탈락 필터
+# ────────────────────────────────────────
+def check_l1_reject(code: str, name: str, news_titles: list) -> tuple:
     """
-    반환: (reject: bool, reason: str)
+    즉시 탈락 조건 검사
+    반환: (통과여부, 탈락사유)
     """
-    today = datetime.today()
+    # 뉴스 제목 기반 위험 키워드 검사
+    for title in news_titles:
+        if name in title:
+            for kw in REJECT_KEYWORDS:
+                if kw in title:
+                    return False, f"위험뉴스: {kw}"
 
-    # 1. CB/BW/유상증자 (최근 2년)
-    if disclosures:
-        for disc in disclosures:
-            for kw in MEZZANINE_KW:
-                if kw in disc:
-                    return True, f"CB/BW/유상증자: {disc[:30]}"
+    # 종목명 자체 위험 패턴
+    danger_patterns = ["스팩", "SPAC", "기업인수"]
+    for p in danger_patterns:
+        if p in name:
+            return False, f"종목명 패턴: {p}"
 
-    # 2. 호재성 공시 4건 이상
-    if disclosures:
-        hype_cnt = sum(1 for d in disclosures for kw in HYPE_KW if kw in d)
-        if hype_cnt >= 4:
-            return True, f"호재 공시 과다({hype_cnt}건)"
-
-    # 3. 가격 위치 (52주 최저가 × 1.5 초과)
-    if not price_df.empty and len(price_df) >= 20:
-        try:
-            year_ago = today - timedelta(days=252)
-            yearly = price_df[price_df.index >= year_ago]
-            if not yearly.empty:
-                low52 = yearly["Low"].min()
-                cur   = price_df["Close"].iloc[-1]
-                if cur > low52 * 1.5:
-                    return True, f"주가 52주최저가×1.5 초과 (현재{cur:,.0f} > 기준{low52*1.5:,.0f})"
-        except Exception:
-            pass
-
-    # 4. 일 거래대금 100억 이상 기록 없음 (최근 3년)
-    if not price_df.empty and "Volume" in price_df.columns and "Close" in price_df.columns:
-        try:
-            price_df["turnover"] = price_df["Close"] * price_df["Volume"]
-            max_turnover = price_df["turnover"].max()
-            if max_turnover < 10_000_000_000:  # 100억
-                return True, f"3년내 일거래대금 100억 미달 (최대{max_turnover/1e8:.1f}억)"
-        except Exception:
-            pass
-
-    return False, ""
+    return True, ""
 
 
-# ─────────────────────────────────────────
-# LAYER 2 — 재무 점수 (최대 15점)
-# ─────────────────────────────────────────
-def calc_l2_financial(corp_code: str) -> tuple:
-    """반환: (score: int, breakdown: dict)"""
-    bd = {}
-    score = 0
-    if not corp_code or not DART_KEY:
-        return score, bd
-
-    cur_year  = datetime.today().year
-    prev_year = cur_year - 1
-
-    fin_cur  = get_dart_financials(corp_code, prev_year)
-    fin_prev = get_dart_financials(corp_code, prev_year - 1)
-    fin_pp   = get_dart_financials(corp_code, prev_year - 2)
-
-    if not fin_cur:
-        return 0, {"재무": "DART 데이터 없음"}
-
-    # 영업이익 3년 흑자 (3점)
-    op_cur  = fin_cur.get("영업이익", 0)
-    op_prev = fin_prev.get("영업이익", 0)
-    op_pp   = fin_pp.get("영업이익", 0)
-    if op_cur > 0 and op_prev > 0 and op_pp > 0:
-        score += 3
-        bd["영업이익3년흑자"] = 3
-    elif op_cur > 0 and op_prev > 0:
-        score += 1
-        bd["영업이익2년흑자"] = 1
-
-    # 매출 >= 시가총액 (2점) — 시총 데이터 없으면 스킵
-    rev = fin_cur.get("매출액", 0)
-    if rev > 0:
-        score += 2
-        bd["매출흑자"] = 2
-
-    # 부채비율 < 100% (3점), < 50% (5점)
-    total_debt   = fin_cur.get("부채총계", 0)
-    total_equity = fin_cur.get("자본총계", 1)
-    if total_equity > 0:
-        debt_ratio = total_debt / total_equity * 100
-        if debt_ratio < 50:
-            score += 5
-            bd["부채비율<50%"] = 5
-        elif debt_ratio < 100:
-            score += 3
-            bd["부채비율<100%"] = 3
-    else:
-        bd["자본잠식"] = "자본총계 0 이하"
-
-    # 유보율 >= 300% (1점), >= 500% (2점)
-    capital = fin_cur.get("자본금", 1)
-    retained = fin_cur.get("이익잉여금", 0)
-    if capital > 0:
-        reserve_ratio = retained / capital * 100
-        if reserve_ratio >= 500:
-            score += 2
-            bd[f"유보율{reserve_ratio:.0f}%"] = 2
-        elif reserve_ratio >= 300:
-            score += 1
-            bd[f"유보율{reserve_ratio:.0f}%"] = 1
-
-    # ROE >= 10% (2점)
-    net_income = fin_cur.get("당기순이익", 0)
-    if total_equity > 0 and net_income > 0:
-        roe = net_income / total_equity * 100
-        if roe >= 10:
-            score += 2
-            bd[f"ROE{roe:.1f}%"] = 2
-
-    # 순자산 > 시가총액 (1점) — 정확한 시총 없으면 대략적 체크
-    net_asset = fin_cur.get("자본총계", 0)
-    if net_asset > 0:
-        score += 1
-        bd["순자산양수"] = 1
-
-    return min(score, 15), bd
-
-
-# ─────────────────────────────────────────
-# LAYER 3 — 유동성 체크
-# ─────────────────────────────────────────
-def check_l3_liquidity(price_df: pd.DataFrame) -> tuple:
-    """반환: (pass: bool, avg10_억: float, flag: str)"""
-    if price_df.empty or "Volume" not in price_df.columns:
-        return False, 0.0, "데이터없음"
+# ────────────────────────────────────────
+# L2: 재무 점수 (최대 15점)
+# ────────────────────────────────────────
+def calc_l2_financial_score(code: str) -> tuple:
+    """
+    재무 점수 계산
+    반환: (점수, 상세딕셔너리)
+    """
     try:
-        price_df["turnover"] = price_df["Close"] * price_df["Volume"]
-        avg10 = price_df["turnover"].tail(10).mean() / 1e8
-        flag  = "매수적기" if avg10 <= 80 else "유동성과다"
-        return True, avg10, flag
+        import FinanceDataReader as fdr
+
+        today     = datetime.now().strftime("%Y%m%d")
+        past_year = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+        df = fdr.DataReader(code, past_year, today)
+
+        if df is None or len(df) < 20:
+            return 0, {"error": "데이터 부족"}
+
+        score = 0
+        detail = {}
+
+        # 1년 수익률 (최대 5점)
+        year_return = (df["Close"].iloc[-1] - df["Close"].iloc[0]) / df["Close"].iloc[0] * 100
+        detail["year_return"] = round(year_return, 1)
+        if year_return > 50:   score += 5
+        elif year_return > 20: score += 4
+        elif year_return > 0:  score += 3
+        elif year_return > -20:score += 1
+
+        # 최근 20일 거래량 증가율 (최대 5점)
+        recent_vol = df["Volume"].iloc[-20:].mean()
+        old_vol    = df["Volume"].iloc[-60:-20].mean() if len(df) >= 60 else df["Volume"].mean()
+        vol_ratio  = recent_vol / old_vol if old_vol > 0 else 1
+        detail["vol_ratio"] = round(vol_ratio, 2)
+        if vol_ratio > 3:   score += 5
+        elif vol_ratio > 2: score += 4
+        elif vol_ratio > 1.5: score += 3
+        elif vol_ratio > 1: score += 2
+
+        # 52주 저점 대비 위치 (최대 5점)
+        low_52w  = df["Low"].min()
+        high_52w = df["High"].max()
+        current  = df["Close"].iloc[-1]
+        if high_52w > low_52w:
+            position = (current - low_52w) / (high_52w - low_52w)
+        else:
+            position = 0.5
+        detail["position_52w"] = round(position, 2)
+        # 저점 부근(0-30%)일수록 높은 점수 (매수 타이밍)
+        if position < 0.15:   score += 5
+        elif position < 0.30: score += 4
+        elif position < 0.50: score += 3
+        elif position < 0.70: score += 2
+        else:                 score += 1
+
+        return min(score, 15), detail
+
+    except Exception as e:
+        log.debug(f"L2 재무점수 실패 ({code}): {e}")
+        return 0, {"error": str(e)}
+
+
+# ────────────────────────────────────────
+# L3: 유동성 검사
+# ────────────────────────────────────────
+def check_l3_liquidity(code: str) -> tuple:
+    """
+    최근 20일 평균 거래대금 10억 이상 확인
+    반환: (통과여부, 평균거래대금_억)
+    """
+    try:
+        import FinanceDataReader as fdr
+
+        today = datetime.now().strftime("%Y%m%d")
+        past  = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        df    = fdr.DataReader(code, past, today)
+
+        if df is None or len(df) < 5:
+            return False, 0
+
+        df["turnover"] = df["Close"] * df["Volume"] / 1e8  # 억원
+        avg_turnover   = df["turnover"].iloc[-20:].mean()
+
+        return avg_turnover >= 10, round(avg_turnover, 1)
+
+    except Exception as e:
+        log.debug(f"L3 유동성 실패 ({code}): {e}")
+        return False, 0
+
+
+# ────────────────────────────────────────
+# L4: DART 공시 분석
+# ────────────────────────────────────────
+def check_l4_dart(code: str, dart_signals: dict) -> tuple:
+    """
+    dart_engine 결과 활용
+    반환: (통과여부, dart_score, 상세)
+    """
+    signal = dart_signals.get(code, {})
+    if not signal:
+        # DART 데이터 없으면 조건부 통과 (점수 0)
+        return True, 0, {"note": "DART 데이터 없음"}
+
+    dart_pass  = signal.get("dart_pass", True)
+    dart_score = signal.get("dart_score", 0)
+    reject_reason = signal.get("reject_reason", "")
+
+    return dart_pass, dart_score, signal
+
+
+# ────────────────────────────────────────
+# L5: 테마 점수 (최대 10점)
+# ────────────────────────────────────────
+def calc_l5_theme_score(code: str, name: str, news_titles: list, theme_scores: dict) -> tuple:
+    """
+    종목명 기반 테마 매핑 + 테마 온도 점수 계산
+    반환: (테마점수, 매핑된테마리스트)
+    """
+    try:
+        from theme_engine import get_stock_themes
+        matched_themes = get_stock_themes(code)
     except Exception:
-        return False, 0.0, "계산오류"
+        matched_themes = []
 
-
-# ─────────────────────────────────────────
-# LAYER 4 — 주주구조 (최대 4점)
-# ─────────────────────────────────────────
-def calc_l4_shareholder(corp_code: str) -> tuple:
-    """반환: (score: int, breakdown: dict)"""
-    bd = {}
-    score = 0
-    if not corp_code or not DART_KEY:
-        return 0, bd
-    try:
-        url = "https://opendart.fss.or.kr/api/majorstock.json"
-        params = {"crtfc_key": DART_KEY, "corp_code": corp_code}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if data.get("status") != "000":
-            return 0, {"주주구조": "데이터없음"}
-        items = data.get("list", [])
-        if not items:
-            return 0, bd
-        # 최대주주 지분율
-        main_holder = items[0]
-        ratio_str = main_holder.get("stkqy_irds", "0") or "0"
-        ratio = float(ratio_str.replace(",", "").replace("%", "") or 0)
-        bd["최대주주지분"] = f"{ratio:.1f}%"
-        if ratio < 30 or ratio > 70:
-            score += 2
-            bd["지분율가점"] = 2
-        elif 30 <= ratio <= 50:
-            bd["지분율경고"] = "30-50% 구간"
-    except Exception as e:
-        bd["주주구조오류"] = str(e)
-    return min(score, 4), bd
-
-
-# ─────────────────────────────────────────
-# LAYER 5 — 테마 점수 (최대 7점)
-# ─────────────────────────────────────────
-def calc_l5_theme(name: str, news_titles: list) -> tuple:
-    """반환: (score: int, matched_themes: list)"""
-    matched = []
-    text = name + " " + " ".join(news_titles)
-
-    for theme, keywords in THEME_DICT.items():
-        if any(kw in text for kw in keywords):
-            matched.append(theme)
+    # 뉴스에서 종목명 언급 횟수로 추가 테마 감지
+    name_mentions = sum(1 for t in news_titles if name in t)
 
     score = 0
-    if len(matched) >= 3:
-        score = 7
-    elif len(matched) == 2:
-        score = 5
-    elif len(matched) == 1:
-        score = 3
-    return score, matched
+    # 테마 매핑된 경우 해당 테마 온도 점수 반영
+    for theme in matched_themes:
+        theme_data = theme_scores.get(theme, {})
+        theme_temp = theme_data.get("score", 0)
+        score += theme_temp * 0.8  # 테마 온도 80% 반영
+
+    # 뉴스 언급 보너스 (최대 3점)
+    mention_bonus = min(name_mentions * 0.5, 3)
+    score += mention_bonus
+
+    return min(round(score, 2), 10), matched_themes
 
 
-# ─────────────────────────────────────────
-# LAYER 6 — 타이밍 (all-or-nothing)
-# ─────────────────────────────────────────
-def check_l6_timing(price_df: pd.DataFrame) -> tuple:
+# ────────────────────────────────────────
+# L6: 매수 타이밍 체크
+# ────────────────────────────────────────
+def check_l6_timing(code: str) -> tuple:
     """
-    반환: (timing_ok: bool, reason: str)
-    조건 3가지 모두 충족 시 True
+    매수 타이밍 조건:
+    1. 현재가 ≤ 52주 저점 × 1.5
+    2. 최근 5일 거래량 증가 (전일比 1.5배 이상)
+    반환: (통과여부, 현재가, 52주저점, 거래량비율)
     """
-    if price_df.empty or len(price_df) < 20:
-        return False, "데이터부족"
     try:
-        today = datetime.today()
-        year_ago = today - timedelta(days=252)
-        yearly = price_df[price_df.index >= year_ago]
-        low52 = yearly["Low"].min() if not yearly.empty else 0
-        cur   = price_df["Close"].iloc[-1]
+        import FinanceDataReader as fdr
 
-        # 조건1: 현재가 <= 52주최저가 × 1.5
-        cond1 = (cur <= low52 * 1.5) if low52 > 0 else False
+        today    = datetime.now().strftime("%Y%m%d")
+        past_year= (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+        df       = fdr.DataReader(code, past_year, today)
 
-        # 조건2: 최근 10일 평균 거래대금 <= 80억
-        price_df_c = price_df.copy()
-        price_df_c["turnover"] = price_df_c["Close"] * price_df_c["Volume"]
-        avg10 = price_df_c["turnover"].tail(10).mean() / 1e8
-        cond2 = avg10 <= 80
+        if df is None or len(df) < 10:
+            return False, 0, 0, 0
 
-        # 조건3: 장대양봉 후 장대음봉 패턴 없음 (단순 체크)
-        recent = price_df.tail(5)
-        bodies = (recent["Close"] - recent["Open"]).abs() / recent["Open"] * 100
-        large = bodies[bodies > 7]
-        cond3 = len(large) == 0  # 최근 5일 내 7% 이상 봉 없음
+        current   = df["Close"].iloc[-1]
+        low_52w   = df["Low"].min()
+        threshold = low_52w * 1.5
 
-        timing_ok = cond1 and cond2
-        reason = f"주가위치{'✅' if cond1 else '❌'} 거래대금{'✅' if cond2 else '❌'} 패턴{'✅' if cond3 else '⚠️'}"
-        return timing_ok, reason
-    except Exception as e:
-        return False, str(e)
+        # 거래량 조건
+        recent_vol = df["Volume"].iloc[-1]
+        avg_vol_20 = df["Volume"].iloc[-21:-1].mean()
+        vol_ratio  = recent_vol / avg_vol_20 if avg_vol_20 > 0 else 0
 
+        price_ok  = current <= threshold
+        volume_ok = vol_ratio >= 1.5
 
-# ─────────────────────────────────────────
-# 종목 분석 통합
-# ─────────────────────────────────────────
-def analyze_stock(idx: int, total: int, code: str, name: str,
-                  mktcap: float, corp_map: dict, news_titles: list) -> dict | None:
-    """단일 종목 전체 레이어 분석"""
-    prefix = f"[{idx+1:3d}/{total}] {name}({code})"
-
-    try:
-        today  = datetime.today()
-        start3 = (today - timedelta(days=365*3)).strftime("%Y-%m-%d")
-        end    = today.strftime("%Y-%m-%d")
-
-        # 가격 데이터 로드
-        price_df = safe_fdr_load(code, start3, end)
-        if price_df.empty:
-            print(f"{prefix} — 가격 데이터 없음, 스킵")
-            return None
-
-        # DART 코드
-        corp_code = corp_map.get(code, "")
-
-        # 공시 목록
-        disclosures = get_dart_disclosures(corp_code, days=730) if corp_code else []
-
-        # L1 즉시 탈락
-        reject, reason = check_l1_reject(code, name, corp_code, disclosures, price_df)
-        if reject:
-            print(f"{prefix} — L1탈락: {reason}")
-            return None
-
-        # L2 재무
-        fin_score, fin_bd = calc_l2_financial(corp_code)
-
-        # L3 유동성
-        liq_pass, avg10, liq_flag = check_l3_liquidity(price_df)
-
-        # L4 주주구조
-        sha_score, sha_bd = calc_l4_shareholder(corp_code)
-
-        # L5 테마
-        theme_score, themes = calc_l5_theme(name, news_titles)
-
-        # L6 타이밍
-        timing_ok, timing_reason = check_l6_timing(price_df)
-
-        # 총점 (최대 30점)
-        # 재무15 + 유동성2 + 주주4 + 테마7 + 타이밍2
-        liq_score   = 2 if liq_pass else 0
-        timing_score = 2 if timing_ok else 0
-        total_score = fin_score + liq_score + sha_score + theme_score + timing_score
-
-        result = {
-            "code":           code,
-            "name":           name,
-            "mktcap_억":      round(mktcap, 1),
-            "total_score":    total_score,
-            "fin_score":      fin_score,
-            "liq_score":      liq_score,
-            "sha_score":      sha_score,
-            "theme_score":    theme_score,
-            "timing_score":   timing_score,
-            "timing":         timing_ok,
-            "timing_reason":  timing_reason,
-            "avg10_억":       round(avg10, 1),
-            "liq_flag":       liq_flag,
-            "themes":         ", ".join(themes),
-            "fin_detail":     json.dumps(fin_bd, ensure_ascii=False),
-            "sha_detail":     json.dumps(sha_bd, ensure_ascii=False),
-            "analyzed_at":    today.strftime("%Y-%m-%d %H:%M"),
-        }
-
-        grade = "🔴탈락"
-        if total_score >= 20:
-            grade = "⭐핵심"
-        elif total_score >= 15:
-            grade = "✅우선"
-        elif total_score >= 10:
-            grade = "👀관심"
-        elif total_score >= MIN_FINAL_SCORE:
-            grade = "📌후보"
-
-        print(f"{prefix} — 총점:{total_score:2d}점 재무:{fin_score} 테마:{theme_score} 타이밍:{'✅' if timing_ok else '❌'} [{grade}]")
-        return result if total_score >= MIN_FINAL_SCORE else None
+        return (price_ok and volume_ok), current, low_52w, round(vol_ratio, 2)
 
     except Exception as e:
-        print(f"{prefix} — 분석 오류: {e}")
-        return None
+        log.debug(f"L6 타이밍 실패 ({code}): {e}")
+        return False, 0, 0, 0
 
 
-# ─────────────────────────────────────────
-# 메인 파이프라인
-# ─────────────────────────────────────────
-def run_pipeline():
-    start_time = time.time()
-    print("=" * 60)
-    print(f"ANDY JO STOCK AI — filter_engine 시작")
-    print(f"실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
+# ────────────────────────────────────────
+# LAUNCHED 트랙 감지
+# ────────────────────────────────────────
+def check_launched(code: str) -> tuple:
+    """
+    이미 출발한 종목 감지:
+    최근 20일 상승률 30% 이상 + 52주 저점 × 1.5 초과
+    반환: (launched여부, 20일수익률)
+    """
+    try:
+        import FinanceDataReader as fdr
 
-    # 유니버스 로드
+        today = datetime.now().strftime("%Y%m%d")
+        past  = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        df    = fdr.DataReader(code, past, today)
+
+        if df is None or len(df) < 10:
+            return False, 0
+
+        current    = df["Close"].iloc[-1]
+        past_price = df["Close"].iloc[0]
+        gain_20d   = (current - past_price) / past_price * 100
+
+        return gain_20d >= 30, round(gain_20d, 1)
+
+    except Exception:
+        return False, 0
+
+
+# ────────────────────────────────────────
+# 단일 종목 전체 분석
+# ────────────────────────────────────────
+def analyze_stock(row: pd.Series, news_titles: list, dart_signals: dict, theme_scores: dict) -> dict:
+    """
+    L0-L6 전체 파이프라인 적용 후 트랙 분류
+    """
+    code = str(row["code"]).zfill(6)
+    name = row["name"]
+    mktcap = row["mktcap_억"]
+
+    result = {
+        "code":   code,
+        "name":   name,
+        "mktcap": mktcap,
+        "track":  None,
+        "total_score": 0,
+        "reject_reason": "",
+        "themes": [],
+        "detail": {}
+    }
+
+    # L1: 즉시 탈락
+    l1_pass, l1_reason = check_l1_reject(code, name, news_titles)
+    if not l1_pass:
+        result["reject_reason"] = f"L1: {l1_reason}"
+        return result
+
+    # L2: 재무 점수
+    l2_score, l2_detail = calc_l2_financial_score(code)
+    result["detail"]["l2"] = l2_detail
+    if l2_score < 3:
+        result["reject_reason"] = f"L2: 재무점수 부족 ({l2_score}점)"
+        return result
+
+    # L3: 유동성
+    l3_pass, l3_turnover = check_l3_liquidity(code)
+    result["detail"]["l3_turnover"] = l3_turnover
+    if not l3_pass:
+        result["reject_reason"] = f"L3: 유동성 부족 ({l3_turnover}억)"
+        return result
+
+    # L4: DART
+    l4_pass, l4_score, l4_detail = check_l4_dart(code, dart_signals)
+    result["detail"]["l4"] = l4_detail
+    if not l4_pass:
+        result["reject_reason"] = f"L4: {l4_detail.get('reject_reason', 'DART 탈락')}"
+        return result
+
+    # L5: 테마 점수
+    l5_score, themes = calc_l5_theme_score(code, name, news_titles, theme_scores)
+    result["themes"] = themes
+    result["detail"]["l5_theme_score"] = l5_score
+
+    # 총점 계산
+    total = l2_score + l4_score + l5_score
+    result["total_score"] = round(total, 2)
+
+    # ── 트랙 분류 ──
+
+    # LAUNCHED 체크 (이미 많이 오른 종목)
+    launched, gain_20d = check_launched(code)
+    result["detail"]["gain_20d"] = gain_20d
+
+    if launched:
+        result["track"] = "LAUNCHED"
+        return result
+
+    # L6: 타이밍 체크
+    l6_pass, current, low_52w, vol_ratio = check_l6_timing(code)
+    result["detail"]["l6"] = {
+        "current": current,
+        "low_52w": low_52w,
+        "vol_ratio": vol_ratio,
+        "timing_ok": l6_pass
+    }
+
+    # BUY_NOW: L6 통과 + 테마점수 5점 이상
+    if l6_pass and l5_score >= 5:
+        result["track"] = "BUY_NOW"
+    # READY: L1-L4 통과, 아직 타이밍 안됨
+    elif total >= MIN_SCORE:
+        result["track"] = "READY"
+    else:
+        result["reject_reason"] = f"총점 부족 ({total}점)"
+
+    return result
+
+
+# ────────────────────────────────────────
+# 전체 파이프라인 실행 (메인 함수)
+# ────────────────────────────────────────
+def run_pipeline(news_data: list, dart_signals: dict, theme_scores: dict) -> dict:
+    """
+    전체 KOSDAQ 종목 대상 L0-L6 필터링 + 3트랙 분류
+    반환: {"READY": [...], "BUY_NOW": [...], "LAUNCHED": [...]}
+    """
+    # 뉴스 제목 리스트 추출
+    news_titles = [a.get("title", "") for a in news_data]
+
+    # L0: 유니버스 로드
     universe = load_kosdaq_universe()
     if universe.empty:
-        print("[ERROR] 유니버스 로드 실패, 종료")
-        return
+        log.error("유니버스 로드 실패 — 파이프라인 중단")
+        return {"READY": [], "BUY_NOW": [], "LAUNCHED": []}
 
     total = len(universe)
-    print(f"\n총 {total}종목 분석 시작\n")
+    log.info(f"필터링 시작: {total}종목 대상")
 
-    # 뉴스 로드
-    try:
-        news_raw = get_saved_news()
-        news_titles = [n.get("title", "") for n in news_raw]
-        print(f"[NEWS] 뉴스 {len(news_titles)}건 로드")
-    except Exception:
-        news_titles = []
-        print("[NEWS] 뉴스 없음 — 테마 점수 종목명 기반으로만 산정")
+    ready    = []
+    buy_now  = []
+    launched = []
+    rejected = 0
 
-    # DART 코드 매핑
-    corp_map = get_dart_corp_map()
+    for i, row in universe.iterrows():
+        if i % 30 == 0:
+            log.info(f"  진행: {i}/{total} | READY {len(ready)} / BUY_NOW {len(buy_now)} / LAUNCHED {len(launched)}")
 
-    # 분석 루프
-    results = []
-    for idx, row in universe.iterrows():
-        code   = str(row["code"]).zfill(6)
-        name   = str(row["name"])
-        mktcap = float(row["mktcap_억"])
+        result = analyze_stock(row, news_titles, dart_signals, theme_scores)
+        time.sleep(0.2)  # API 부하 방지
 
-        result = analyze_stock(idx, total, code, name, mktcap, corp_map, news_titles)
-        if result:
-            results.append(result)
+        track = result.get("track")
+        if track == "BUY_NOW":
+            buy_now.append(result)
+        elif track == "READY":
+            ready.append(result)
+        elif track == "LAUNCHED":
+            launched.append(result)
+        else:
+            rejected += 1
 
-        # 중간 저장
-        if (idx + 1) % SAVE_INTERVAL == 0 and results:
-            _save_intermediate(results)
+    # 점수 기준 정렬
+    buy_now.sort(key=lambda x: -x["total_score"])
+    ready.sort(key=lambda x: -x["total_score"])
+    launched.sort(key=lambda x: -x["detail"].get("gain_20d", 0))
 
-    # 최종 정렬 및 저장
-    if results:
-        df = pd.DataFrame(results)
-        df = df.sort_values(
-            ["timing", "total_score"],
-            ascending=[False, False]
-        ).head(TOP_N).reset_index(drop=True)
-        save_candidates(df)
-        print(f"\n{'='*60}")
-        print(f"✅ 완료: 후보종목 {len(df)}건 저장")
-        print(f"   Timing True: {df['timing'].sum()}건")
-        print(f"   평균 점수: {df['total_score'].mean():.1f}점")
-    else:
-        print("\n[결과] 조건 통과 종목 없음")
+    # TOP N 제한
+    buy_now  = buy_now[:TOP_N]
+    ready    = ready[:TOP_N]
+    launched = launched[:TOP_N]
 
-    elapsed = time.time() - start_time
-    print(f"   소요 시간: {elapsed/60:.1f}분")
-    print("=" * 60)
+    log.info(f"필터링 완료 — READY {len(ready)} / BUY_NOW {len(buy_now)} / LAUNCHED {len(launched)} / 탈락 {rejected}")
 
-
-def _save_intermediate(results: list):
-    """중간 저장 (오류 무시)"""
-    try:
-        df = pd.DataFrame(results)
-        df = df.sort_values(["timing", "total_score"], ascending=[False, False])
-        save_candidates(df)
-        print(f"  [중간저장] {len(df)}건 저장됨")
-    except Exception as e:
-        print(f"  [중간저장 실패] {e}")
-
-
-if __name__ == "__main__":
-    run_pipeline()
+    return {
+        "READY":    ready,
+        "BUY_NOW":  buy_now,
+        "LAUNCHED": launched
+    }
