@@ -1,8 +1,8 @@
 requests==2.31.0
 beautifulsoup4==4.12.2
 pandas==2.1.4
-FinanceDataReader
-pykrx==1.0.45
+finance-datareader
+pykrx
 feedparser==6.0.10
 python-dotenv==1.0.0
 gspread==5.12.0
@@ -11,4 +11,4 @@ streamlit==1.29.0
 lxml==4.9.3
 html5lib==1.1
 schedule==1.2.0
-dart-fss==0.4.13
+dart-fss
